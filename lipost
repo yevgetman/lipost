@@ -5,7 +5,9 @@ Usage:
   lipost init                       # interactive first-time setup
   lipost auth                       # one-time OAuth login
   lipost post "your text here"      # post text to your feed
+  lipost post --dry-run "text"      # show request without sending
   lipost post -                     # read post body from stdin
+  lipost delete <urn>               # delete a post by its URN
   lipost whoami                     # show authenticated member
 """
 
@@ -177,8 +179,16 @@ def cmd_whoami():
 
 
 def cmd_post(args):
+    dry_run = False
+    rest = []
+    for a in args:
+        if a in ("--dry-run", "-n"):
+            dry_run = True
+        else:
+            rest.append(a)
+    args = rest
     if not args:
-        die("usage: lipost post \"text\"  (or: lipost post -)")
+        die("usage: lipost post [--dry-run] \"text\"  (or: lipost post -)")
     if args[0] == "-":
         text = sys.stdin.read()
     else:
@@ -201,6 +211,17 @@ def cmd_post(args):
         "lifecycleState": "PUBLISHED",
         "isReshareDisabledByAuthor": False,
     }
+    if dry_run:
+        print("DRY RUN — nothing will be sent to LinkedIn.")
+        print(f"POST https://api.linkedin.com/rest/posts")
+        print("Headers:")
+        print("  Authorization: Bearer <redacted>")
+        print("  LinkedIn-Version: 202405")
+        print("  X-Restli-Protocol-Version: 2.0.0")
+        print("  Content-Type: application/json")
+        print("Body:")
+        print(json.dumps(payload, indent=2))
+        return
     status, headers, body = http_json(
         "POST", "https://api.linkedin.com/rest/posts",
         headers={
@@ -215,8 +236,29 @@ def cmd_post(args):
     post_id = headers.get("x-restli-id") or headers.get("X-RestLi-Id") or body.get("id")
     print(f"posted: {post_id}")
     if post_id and post_id.startswith("urn:li:share:"):
-        share_id = post_id.split(":")[-1]
         print(f"url:    https://www.linkedin.com/feed/update/{post_id}/")
+    print(f"to delete: lipost delete {post_id}")
+
+
+def cmd_delete(args):
+    if not args:
+        die("usage: lipost delete <post-urn>  (e.g. urn:li:share:1234567890)")
+    urn = args[0]
+    if not urn.startswith("urn:li:"):
+        die(f"expected a LinkedIn URN, got: {urn}")
+    tok = get_token()
+    encoded = urllib.parse.quote(urn, safe="")
+    status, _, body = http_json(
+        "DELETE", f"https://api.linkedin.com/rest/posts/{encoded}",
+        headers={
+            "Authorization": f"Bearer {tok['access_token']}",
+            "LinkedIn-Version": "202405",
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+    )
+    if status not in (200, 204):
+        die(f"delete failed (HTTP {status}): {body}")
+    print(f"deleted: {urn}")
 
 
 def _prompt(label, default=None, secret=False):
@@ -318,6 +360,8 @@ def main():
         cmd_auth()
     elif cmd == "post":
         cmd_post(rest)
+    elif cmd == "delete":
+        cmd_delete(rest)
     elif cmd == "whoami":
         cmd_whoami()
     elif cmd in ("-h", "--help", "help"):
