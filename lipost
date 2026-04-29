@@ -2,13 +2,15 @@
 """Tiny LinkedIn personal-feed posting CLI.
 
 Usage:
-  lipost init                       # interactive first-time setup
-  lipost auth                       # one-time OAuth login
-  lipost post "your text here"      # post text to your feed
-  lipost post --dry-run "text"      # show request without sending
-  lipost post -                     # read post body from stdin
-  lipost delete <urn>               # delete a post by its URN
-  lipost whoami                     # show authenticated member
+  lipost init                                     # interactive first-time setup
+  lipost auth                                     # one-time OAuth login
+  lipost post "your text here"                    # post text to your feed
+  lipost post --image pic.jpg "caption"           # post image with optional caption
+  lipost post --image pic.jpg --alt "desc" "..."  # image with alt text
+  lipost post --dry-run "text"                    # show request without sending
+  lipost post -                                   # read post body from stdin
+  lipost delete <urn>                             # delete a post by its URN
+  lipost whoami                                   # show authenticated member
 """
 
 import json
@@ -178,24 +180,77 @@ def cmd_whoami():
     print(f"urn:       urn:li:person:{tok.get('member_id')}")
 
 
+def _upload_image(tok, author, path):
+    """Three-step image upload: initialize, PUT bytes, return image URN."""
+    if not os.path.isfile(path):
+        die(f"image not found: {path}")
+    init_status, _, init_body = http_json(
+        "POST", "https://api.linkedin.com/rest/images?action=initializeUpload",
+        headers={
+            "Authorization": f"Bearer {tok['access_token']}",
+            "LinkedIn-Version": "202405",
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+        data={"initializeUploadRequest": {"owner": author}},
+    )
+    if init_status not in (200, 201):
+        die(f"image init failed (HTTP {init_status}): {init_body}")
+    value = init_body.get("value", {})
+    upload_url = value.get("uploadUrl")
+    image_urn = value.get("image")
+    if not upload_url or not image_urn:
+        die(f"image init missing uploadUrl/image: {init_body}")
+
+    with open(path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        upload_url, data=data, method="PUT",
+        headers={"Authorization": f"Bearer {tok['access_token']}"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            if resp.status not in (200, 201):
+                die(f"image upload failed: HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        die(f"image upload failed: HTTP {e.code} {e.read().decode()[:300]}")
+    return image_urn
+
+
 def cmd_post(args):
     dry_run = False
+    image_path = None
+    alt_text = None
     rest = []
-    for a in args:
+    i = 0
+    while i < len(args):
+        a = args[i]
         if a in ("--dry-run", "-n"):
             dry_run = True
+        elif a in ("--image", "-i"):
+            i += 1
+            if i >= len(args):
+                die("--image requires a file path")
+            image_path = args[i]
+        elif a == "--alt":
+            i += 1
+            if i >= len(args):
+                die("--alt requires text")
+            alt_text = args[i]
         else:
             rest.append(a)
+        i += 1
     args = rest
+
+    if not args and not image_path:
+        die("usage: lipost post [--dry-run] [--image PATH [--alt TEXT]] \"text\"")
     if not args:
-        die("usage: lipost post [--dry-run] \"text\"  (or: lipost post -)")
-    if args[0] == "-":
-        text = sys.stdin.read()
+        text = ""
+    elif args[0] == "-":
+        text = sys.stdin.read().strip()
     else:
-        text = " ".join(args)
-    text = text.strip()
-    if not text:
-        die("empty post body")
+        text = " ".join(args).strip()
+    if not text and not image_path:
+        die("empty post body and no image")
 
     tok = get_token()
     author = f"urn:li:person:{tok['member_id']}"
@@ -211,6 +266,17 @@ def cmd_post(args):
         "lifecycleState": "PUBLISHED",
         "isReshareDisabledByAuthor": False,
     }
+    if image_path and dry_run:
+        payload["content"] = {"media": {"id": "<image-urn-after-upload>", "altText": alt_text or ""}}
+    elif image_path:
+        print(f"uploading image: {image_path}")
+        image_urn = _upload_image(tok, author, image_path)
+        media = {"id": image_urn}
+        if alt_text:
+            media["altText"] = alt_text
+        payload["content"] = {"media": media}
+        print(f"image urn: {image_urn}")
+
     if dry_run:
         print("DRY RUN — nothing will be sent to LinkedIn.")
         print(f"POST https://api.linkedin.com/rest/posts")

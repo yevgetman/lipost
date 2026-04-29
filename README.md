@@ -89,14 +89,29 @@ chmod 600 ~/.config/linkedin-cli/config.json
 ## Usage
 
 ```bash
-lipost init                              # interactive first-time setup
-lipost auth                              # one-time browser OAuth
-lipost whoami                            # show authenticated person URN
-lipost post "Hello LinkedIn!"            # post text to your feed
-lipost post --dry-run "test"             # show the request without sending
-lipost post -                            # read post body from stdin
-lipost delete urn:li:share:1234567890    # delete a post by its URN
+lipost init                                            # interactive first-time setup
+lipost auth                                            # one-time browser OAuth
+lipost whoami                                          # show authenticated person URN
+
+# Text posts
+lipost post "Hello LinkedIn!"                          # post text to your feed
+lipost post -                                          # read post body from stdin
+lipost post --dry-run "test"                           # show the request without sending
+
+# Image posts (with optional caption + alt text)
+lipost post --image photo.jpg "Caption goes here"
+lipost post --image photo.png --alt "A red bicycle" "Out for a ride 🚴"
+lipost post --image photo.jpg                         # image with no caption
+
+# Delete
+lipost delete urn:li:share:1234567890
 ```
+
+### Image posts
+
+`--image PATH` (or `-i PATH`) attaches a single image to a post. JPEG and PNG are the safe choices. The caption (positional text) is optional — you can post just an image. `--alt "TEXT"` sets accessibility alt text and is recommended.
+
+Under the hood the CLI does the standard 3-step LinkedIn image flow: initialize an upload to get an image URN, PUT the bytes, then create the post with `content.media.id` set to that URN. No extra API products or scopes are required beyond what `lipost auth` already grants.
 
 ## Testing without spamming your feed
 
