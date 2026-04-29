@@ -103,6 +103,9 @@ lipost post --image photo.jpg "Caption goes here"
 lipost post --image photo.png --alt "A red bicycle" "Out for a ride 🚴"
 lipost post --image photo.jpg                         # image with no caption
 
+# Edit (commentary text only — image/visibility are locked after publish)
+lipost edit urn:li:share:1234567890 "Updated text here"
+
 # Delete
 lipost delete urn:li:share:1234567890
 ```
