@@ -188,7 +188,7 @@ def _upload_image(tok, author, path):
         "POST", "https://api.linkedin.com/rest/images?action=initializeUpload",
         headers={
             "Authorization": f"Bearer {tok['access_token']}",
-            "LinkedIn-Version": "202405",
+            "LinkedIn-Version": "202604",
             "X-Restli-Protocol-Version": "2.0.0",
         },
         data={"initializeUploadRequest": {"owner": author}},
@@ -205,7 +205,7 @@ def _upload_image(tok, author, path):
         data = f.read()
     req = urllib.request.Request(
         upload_url, data=data, method="PUT",
-        headers={"Authorization": f"Bearer {tok['access_token']}"},
+        headers={"Content-Type": "application/octet-stream"},
     )
     try:
         with urllib.request.urlopen(req) as resp:
@@ -282,7 +282,7 @@ def cmd_post(args):
         print(f"POST https://api.linkedin.com/rest/posts")
         print("Headers:")
         print("  Authorization: Bearer <redacted>")
-        print("  LinkedIn-Version: 202405")
+        print("  LinkedIn-Version: 202604")
         print("  X-Restli-Protocol-Version: 2.0.0")
         print("  Content-Type: application/json")
         print("Body:")
@@ -292,7 +292,7 @@ def cmd_post(args):
         "POST", "https://api.linkedin.com/rest/posts",
         headers={
             "Authorization": f"Bearer {tok['access_token']}",
-            "LinkedIn-Version": "202405",
+            "LinkedIn-Version": "202604",
             "X-Restli-Protocol-Version": "2.0.0",
         },
         data=payload,
@@ -318,7 +318,7 @@ def cmd_delete(args):
         "DELETE", f"https://api.linkedin.com/rest/posts/{encoded}",
         headers={
             "Authorization": f"Bearer {tok['access_token']}",
-            "LinkedIn-Version": "202405",
+            "LinkedIn-Version": "202604",
             "X-Restli-Protocol-Version": "2.0.0",
         },
     )
