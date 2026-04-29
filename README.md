@@ -6,6 +6,9 @@ A tiny, dependency-free Python CLI for posting text to your **personal LinkedIn 
 - OAuth 2.0 flow with a local redirect listener.
 - Credentials and tokens are stored under `~/.config/linkedin-cli/`, **never** inside the repo.
 
+> **⚠️ Heads up: the `LinkedIn-Version` header may need bumping.**
+> LinkedIn pins every API call to a monthly version (e.g. `202604`) and rotates them on a ~12-month deprecation window. If image upload, post, edit, or delete fails with **HTTP 426 / `NONEXISTENT_VERSION`**, open `lipost`, find the `LinkedIn-Version` constants (there are several occurrences), and bump them to a current month. Available versions are listed in the [LinkedIn API versioning docs](https://learn.microsoft.com/en-us/linkedin/marketing/versioning).
+
 ## Quick start
 
 ```bash
@@ -135,14 +138,6 @@ LinkedIn does **not** offer a sandbox / test environment for the Posts API. Two 
    deleted: urn:li:share:7185023485712384000
    ```
    Delivery to your network's feeds isn't instant; deleting within seconds makes it very unlikely anyone saw it.
-
-## Where do posts go?
-
-To your **personal feed** — the one your connections see at `linkedin.com/in/<you>`.
-
-The post payload sets `author = "urn:li:person:<your-member-id>"`, where the member ID is captured at auth time from the OIDC `userinfo` endpoint. The Company Page attached to the app for administrative reasons is **not** in the post payload and is not posted to.
-
-To post to a Company Page instead, you'd need the `w_organization_social` scope and a different author URN — out of scope for this tool.
 
 ## Token lifetime
 
