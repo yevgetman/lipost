@@ -2,6 +2,7 @@
 """Tiny LinkedIn personal-feed posting CLI.
 
 Usage:
+  lipost init                       # interactive first-time setup
   lipost auth                       # one-time OAuth login
   lipost post "your text here"      # post text to your feed
   lipost post -                     # read post body from stdin
@@ -218,12 +219,102 @@ def cmd_post(args):
         print(f"url:    https://www.linkedin.com/feed/update/{post_id}/")
 
 
+def _prompt(label, default=None, secret=False):
+    suffix = f" [{default}]" if default else ""
+    if secret:
+        import getpass
+        val = getpass.getpass(f"{label}{suffix}: ").strip()
+    else:
+        val = input(f"{label}{suffix}: ").strip()
+    return val or (default or "")
+
+
+def _pick_symlink_dir():
+    """Return the first writable, PATH-listed directory we'd suggest for the symlink."""
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    candidates = [
+        os.path.expanduser("~/.local/bin"),
+        os.path.expanduser("~/bin"),
+        "/usr/local/bin",
+    ]
+    for c in candidates:
+        if c in path_dirs and os.path.isdir(c) and os.access(c, os.W_OK):
+            return c
+    for c in candidates:
+        if os.path.isdir(c) and os.access(c, os.W_OK):
+            return c
+    return os.path.expanduser("~/.local/bin")
+
+
+def cmd_init():
+    print("lipost setup\n" + "-" * 40)
+    print(
+        "Before continuing you need a LinkedIn developer app:\n"
+        "  1. Go to https://developer.linkedin.com and create an app.\n"
+        "  2. In the Auth tab, add this Authorized redirect URL:\n"
+        f"       {REDIRECT_URI}\n"
+        "  3. In the Products tab, request:\n"
+        "       - Sign In with LinkedIn using OpenID Connect\n"
+        "       - Share on LinkedIn\n"
+        "  4. Copy the Client ID and Client Secret from the Auth tab.\n"
+    )
+
+    existing = load_json(CONFIG_PATH) or {}
+    if existing.get("client_id"):
+        print(f"Existing config found at {CONFIG_PATH}")
+        if _prompt("Overwrite? (y/N)", "N").lower() != "y":
+            print("Keeping existing config.")
+        else:
+            existing = {}
+
+    if not existing.get("client_id"):
+        cid = _prompt("Client ID")
+        if not cid:
+            die("client id is required")
+        csec = _prompt("Client Secret", secret=True)
+        if not csec:
+            die("client secret is required")
+        save_json(CONFIG_PATH, {"client_id": cid, "client_secret": csec})
+        print(f"Wrote {CONFIG_PATH} (chmod 600)")
+
+    # Optional symlink
+    script_path = os.path.realpath(__file__)
+    suggested = _pick_symlink_dir()
+    print()
+    print(f"This script lives at: {script_path}")
+    if _prompt(f"Create a `lipost` command on your PATH in {suggested}? (Y/n)", "Y").lower() != "n":
+        target_dir = _prompt("Install directory", suggested)
+        target_dir = os.path.expanduser(target_dir)
+        os.makedirs(target_dir, exist_ok=True)
+        link_path = os.path.join(target_dir, "lipost")
+        if os.path.lexists(link_path):
+            if _prompt(f"{link_path} already exists. Overwrite? (y/N)", "N").lower() != "y":
+                print("Skipped symlink.")
+            else:
+                os.remove(link_path)
+                os.symlink(script_path, link_path)
+                print(f"Linked {link_path} -> {script_path}")
+        else:
+            os.symlink(script_path, link_path)
+            print(f"Linked {link_path} -> {script_path}")
+        if target_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            print(f"warning: {target_dir} is not on your PATH. Add it to your shell rc, e.g.:")
+            print(f'  export PATH="{target_dir}:$PATH"')
+
+    print()
+    print("Setup complete. Next:")
+    print("  lipost auth     # complete OAuth in your browser")
+    print("  lipost post \"hello world\"")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
     cmd, rest = sys.argv[1], sys.argv[2:]
-    if cmd == "auth":
+    if cmd == "init":
+        cmd_init()
+    elif cmd == "auth":
         cmd_auth()
     elif cmd == "post":
         cmd_post(rest)
