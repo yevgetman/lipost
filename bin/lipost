@@ -1,0 +1,2655 @@
+#!/usr/bin/env python3
+"""lipost — LinkedIn posting suite.
+
+Three layers, one binary:
+
+  Primitive   lipost {init,auth,whoami,post,edit,delete}
+              Direct LinkedIn API operations.
+
+  Article     lipost article <url>
+              URL → Claude → reviewed draft → posted (or queued).
+
+  Bot/queue   lipost {drafts,bot} ...
+              Draft queue, image generation, launchd-driven autoposter.
+
+Run `lipost cheatsheet` for a curated short list, or `lipost <cmd> --help`.
+
+Single file, Python 3 stdlib only — no `pip install`. macOS for the bot
+(uses launchd); the rest is portable.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+# ── paths & constants ───────────────────────────────────────────────────────
+
+HOME = Path.home()
+SCRIPT_PATH = Path(__file__).resolve()
+REPO_DIR = SCRIPT_PATH.parent.parent      # .../lipost/bin/lipost → .../lipost
+SHARE_DIR = REPO_DIR / "share"
+
+# Standardized user-data locations (XDG-ish on macOS).
+CONFIG_DIR = HOME / ".config" / "lipost"
+DATA_DIR = HOME / ".local" / "share" / "lipost"
+
+AUTH_FILE = CONFIG_DIR / "auth.json"      # client_id / client_secret
+TOKEN_FILE = CONFIG_DIR / "token.json"    # OAuth access token + member URN
+BOT_CONFIG_FILE = CONFIG_DIR / "bot.json"
+BOT_STATE_FILE = CONFIG_DIR / "state.json"
+POSTS_FILE = CONFIG_DIR / "posts.jsonl"   # append-only post history
+PROMPT_FILE = CONFIG_DIR / "prompt.md"    # live persona prompt (image + article both consume)
+USER_STYLE_FILE = CONFIG_DIR / "user_style.md"
+LAUNCHD_DIR = CONFIG_DIR / "launchd"
+
+LOG_FILE = HOME / "Library" / "Logs" / "lipost.log"
+
+# Repo-shipped read-only assets.
+EXAMPLE_PROMPT_FILE = SHARE_DIR / "prompt.example.md"
+BAKED_STYLE_FILE = SHARE_DIR / "style.md"
+
+# Drafts + image staging live in user data, not the repo.
+DRAFTS_DIR = DATA_DIR / "drafts"
+IMAGES_DIR = DATA_DIR / "images"
+IMAGES_PENDING = IMAGES_DIR / "pending"
+IMAGES_SKIPPED = IMAGES_DIR / "skipped"
+
+# Symlink installed onto PATH for tab-complete.
+BIN_LINK = HOME / ".local" / "bin" / "lipost"
+
+# launchd labels (renamed from the old lipost-bot.* scheme; init unloads the old ones).
+LABEL_POST = "local.lipost.post"
+LABEL_GENERATE = "local.lipost.generate"
+PLIST_POST_SRC = LAUNCHD_DIR / f"{LABEL_POST}.plist"
+PLIST_POST_DEST = HOME / "Library" / "LaunchAgents" / f"{LABEL_POST}.plist"
+PLIST_GEN_SRC = LAUNCHD_DIR / f"{LABEL_GENERATE}.plist"
+PLIST_GEN_DEST = HOME / "Library" / "LaunchAgents" / f"{LABEL_GENERATE}.plist"
+
+# Old labels for cleanup on init.
+OLD_LABEL_POST = "local.lipost-bot"
+OLD_LABEL_GENERATE = "local.lipost-bot.generate"
+OLD_PLIST_POST_DEST = HOME / "Library" / "LaunchAgents" / f"{OLD_LABEL_POST}.plist"
+OLD_PLIST_GEN_DEST = HOME / "Library" / "LaunchAgents" / f"{OLD_LABEL_GENERATE}.plist"
+
+# Old paths for migration / read-fallback.
+OLD_AUTH_DIR = HOME / ".config" / "linkedin-cli"
+OLD_AUTH_FILE = OLD_AUTH_DIR / "config.json"
+OLD_TOKEN_FILE = OLD_AUTH_DIR / "token.json"
+OLD_BOT_DIR = HOME / ".config" / "lipost-bot"
+OLD_BOT_CONFIG_FILE = OLD_BOT_DIR / "config.json"
+OLD_BOT_STATE_FILE = OLD_BOT_DIR / "state.json"
+OLD_BOT_POSTS_FILE = OLD_BOT_DIR / "posts.jsonl"
+OLD_BOT_LOG = HOME / "Library" / "Logs" / "lipost-bot.log"
+OLD_BOT_REPO_GUESSES = [HOME / "code" / "lipost-bot", HOME / "src" / "lipost-bot"]
+OLD_BIN_LINK = HOME / ".local" / "bin" / "lipost-bot"
+
+# OAuth.
+REDIRECT_PORT = 8765
+REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/callback"
+SCOPES = "openid profile w_member_social"
+
+# LinkedIn API. Bump if image upload / post / edit / delete ever fail with
+# HTTP 426 / NONEXISTENT_VERSION; LinkedIn rotates monthly versions on a
+# ~12-month deprecation window. https://learn.microsoft.com/en-us/linkedin/marketing/versioning
+LINKEDIN_API_VERSION = "202604"
+
+# Subprocess PATH for cron-launched children (launchd env is minimal).
+CRON_PATH = ":".join([
+    str(HOME / ".local" / "bin"),
+    str(HOME / ".bun" / "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+])
+
+CLAUDE_DEFAULT_MODEL = "claude-opus-4-7"
+ARTICLE_TIMEOUT_SECS = 10 * 60
+GENERATE_TIMEOUT_SECS = 10 * 60
+POST_TIMEOUT_SECS = 5 * 60
+
+URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+URN_RE = re.compile(r"posted:\s+(urn:li:\S+)")
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif"}
+IMAGE_PLACEHOLDER = "{{IMAGE_PATH}}"
+
+TEMPLATE_MARKER = "<!-- TEMPLATE: lipost will refuse to run while this line is present"
+VALID_DRAFT_STATUSES = {"pending_approval", "approved", "rejected", "posted"}
+
+DEFAULT_BOT_CONFIG = {
+    "active": False,
+    "baseline_hour": 9,
+    "jitter_max_secs": 43200,            # 12h → 09:00–21:00 default window
+    "min_hours_between_runs": 20,
+    "permission_mode": "bypassPermissions",
+    "claude_model": CLAUDE_DEFAULT_MODEL,
+    "generate_active": False,
+    "generate_interval_hours": 8,
+}
+
+
+# ── tiny helpers ────────────────────────────────────────────────────────────
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_json(path: Path, default=None):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return default
+
+
+def save_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(path, 0o600)
+
+
+def http_json(method, url, headers=None, data=None, form=False):
+    headers = dict(headers or {})
+    body = None
+    if data is not None:
+        if form:
+            body = urllib.parse.urlencode(data).encode()
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        else:
+            body = json.dumps(data).encode()
+            headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode()
+            return resp.status, dict(resp.headers), (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {"raw": raw}
+        return e.code, dict(e.headers or {}), parsed
+
+
+def log(msg: str) -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
+    with LOG_FILE.open("a") as f:
+        f.write(line)
+
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def hours_since(dt):
+    if dt is None:
+        return None
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+
+def fmt_local(dt) -> str:
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _prompt(label, default=None, secret=False):
+    suffix = f" [{default}]" if default else ""
+    if secret:
+        import getpass
+        val = getpass.getpass(f"{label}{suffix}: ").strip()
+    else:
+        val = input(f"{label}{suffix}: ").strip()
+    return val or (default or "")
+
+
+def _confirm(label: str, default_yes: bool = True) -> bool:
+    suffix = " [Y/n]" if default_yes else " [y/N]"
+    raw = input(f"{label}{suffix}: ").strip().lower()
+    if not raw:
+        return default_yes
+    return raw in ("y", "yes")
+
+
+# ── auth / OAuth ────────────────────────────────────────────────────────────
+
+def get_auth_config():
+    """Return (client_id, client_secret). Tries new path first, then env vars,
+    then the legacy ~/.config/linkedin-cli/config.json so existing installs
+    keep working before re-init."""
+    cfg = load_json(AUTH_FILE) or load_json(OLD_AUTH_FILE) or {}
+    cid = os.environ.get("LINKEDIN_CLIENT_ID") or cfg.get("client_id")
+    csec = os.environ.get("LINKEDIN_CLIENT_SECRET") or cfg.get("client_secret")
+    if not cid or not csec:
+        die(
+            "missing client credentials. Either set LINKEDIN_CLIENT_ID and "
+            f"LINKEDIN_CLIENT_SECRET env vars, or run `lipost init` (writes {AUTH_FILE})."
+        )
+    return cid, csec
+
+
+def get_token():
+    tok = load_json(TOKEN_FILE) or load_json(OLD_TOKEN_FILE)
+    if not tok:
+        die("not authenticated. Run: lipost auth")
+    expires = tok.get("obtained_at", 0) + tok.get("expires_in", 0)
+    if expires and time.time() > expires - 60:
+        print(
+            "warning: token may be expired — re-run `lipost auth` if posting fails",
+            file=sys.stderr,
+        )
+    return tok
+
+
+class _CBHandler(BaseHTTPRequestHandler):
+    captured = {}
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/callback":
+            self.send_response(404)
+            self.end_headers()
+            return
+        params = dict(urllib.parse.parse_qsl(parsed.query))
+        _CBHandler.captured.update(params)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        msg = "Auth complete. You can close this tab."
+        if "error" in params:
+            msg = f"Auth failed: {params.get('error_description', params['error'])}"
+        self.wfile.write(f"<html><body><h2>{msg}</h2></body></html>".encode())
+
+    def log_message(self, *a, **kw):
+        pass
+
+
+def cmd_auth(args):
+    cid, csec = get_auth_config()
+    state = secrets.token_urlsafe(16)
+    auth_url = "https://www.linkedin.com/oauth/v2/authorization?" + urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id": cid,
+        "redirect_uri": REDIRECT_URI,
+        "state": state,
+        "scope": SCOPES,
+    })
+    print(f"Opening browser for LinkedIn auth...\nIf it doesn't open: {auth_url}")
+    webbrowser.open(auth_url)
+
+    server = HTTPServer(("localhost", REDIRECT_PORT), _CBHandler)
+    while "code" not in _CBHandler.captured and "error" not in _CBHandler.captured:
+        server.handle_request()
+    captured = _CBHandler.captured
+    if captured.get("state") != state:
+        die("state mismatch — possible CSRF, aborting")
+    if "error" in captured:
+        die(f"auth error: {captured.get('error_description', captured['error'])}")
+
+    status, _, body = http_json(
+        "POST", "https://www.linkedin.com/oauth/v2/accessToken",
+        data={
+            "grant_type": "authorization_code",
+            "code": captured["code"],
+            "redirect_uri": REDIRECT_URI,
+            "client_id": cid,
+            "client_secret": csec,
+        },
+        form=True,
+    )
+    if status != 200 or "access_token" not in body:
+        die(f"token exchange failed: {body}")
+    body["obtained_at"] = int(time.time())
+
+    status, _, info = http_json(
+        "GET", "https://api.linkedin.com/v2/userinfo",
+        headers={"Authorization": f"Bearer {body['access_token']}"},
+    )
+    if status != 200 or "sub" not in info:
+        die(f"userinfo fetch failed: {info}")
+    body["member_id"] = info["sub"]
+    body["name"] = info.get("name")
+
+    save_json(TOKEN_FILE, body)
+    print(f"Authenticated as {info.get('name')} (urn:li:person:{info['sub']})")
+    print(f"Token saved to {TOKEN_FILE}")
+
+
+def cmd_whoami(args):
+    tok = get_token()
+    print(f"name:      {tok.get('name')}")
+    print(f"member id: {tok.get('member_id')}")
+    print(f"urn:       urn:li:person:{tok.get('member_id')}")
+
+
+# ── LinkedIn API: post / edit / delete / image upload ───────────────────────
+
+def _upload_image(tok, author, path):
+    """Three-step image upload: initialize, PUT bytes, return image URN."""
+    if not os.path.isfile(path):
+        die(f"image not found: {path}")
+    init_status, _, init_body = http_json(
+        "POST", "https://api.linkedin.com/rest/images?action=initializeUpload",
+        headers={
+            "Authorization": f"Bearer {tok['access_token']}",
+            "LinkedIn-Version": LINKEDIN_API_VERSION,
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+        data={"initializeUploadRequest": {"owner": author}},
+    )
+    if init_status not in (200, 201):
+        die(f"image init failed (HTTP {init_status}): {init_body}")
+    value = init_body.get("value", {})
+    upload_url = value.get("uploadUrl")
+    image_urn = value.get("image")
+    if not upload_url or not image_urn:
+        die(f"image init missing uploadUrl/image: {init_body}")
+
+    with open(path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        upload_url, data=data, method="PUT",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            if resp.status not in (200, 201):
+                die(f"image upload failed: HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        die(f"image upload failed: HTTP {e.code} {e.read().decode()[:300]}")
+    return image_urn
+
+
+def _post_to_linkedin(text: str, image_path: str | None, alt_text: str | None,
+                     dry_run: bool) -> None:
+    tok = get_token()
+    author = f"urn:li:person:{tok['member_id']}"
+    payload = {
+        "author": author,
+        "commentary": text,
+        "visibility": "PUBLIC",
+        "distribution": {
+            "feedDistribution": "MAIN_FEED",
+            "targetEntities": [],
+            "thirdPartyDistributionChannels": [],
+        },
+        "lifecycleState": "PUBLISHED",
+        "isReshareDisabledByAuthor": False,
+    }
+    if image_path and dry_run:
+        payload["content"] = {"media": {"id": "<image-urn-after-upload>",
+                                        "altText": alt_text or ""}}
+    elif image_path:
+        print(f"uploading image: {image_path}")
+        image_urn = _upload_image(tok, author, image_path)
+        media = {"id": image_urn}
+        if alt_text:
+            media["altText"] = alt_text
+        payload["content"] = {"media": media}
+        print(f"image urn: {image_urn}")
+
+    if dry_run:
+        print("DRY RUN — nothing will be sent to LinkedIn.")
+        print("POST https://api.linkedin.com/rest/posts")
+        print("Headers:")
+        print("  Authorization: Bearer <redacted>")
+        print(f"  LinkedIn-Version: {LINKEDIN_API_VERSION}")
+        print("  X-Restli-Protocol-Version: 2.0.0")
+        print("  Content-Type: application/json")
+        print("Body:")
+        print(json.dumps(payload, indent=2))
+        return
+
+    status, headers, body = http_json(
+        "POST", "https://api.linkedin.com/rest/posts",
+        headers={
+            "Authorization": f"Bearer {tok['access_token']}",
+            "LinkedIn-Version": LINKEDIN_API_VERSION,
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+        data=payload,
+    )
+    if status not in (200, 201):
+        die(f"post failed (HTTP {status}): {body}")
+    post_id = headers.get("x-restli-id") or headers.get("X-RestLi-Id") or body.get("id")
+    print(f"posted: {post_id}")
+    if post_id and post_id.startswith("urn:li:share:"):
+        print(f"url:    https://www.linkedin.com/feed/update/{post_id}/")
+    print(f"to delete: lipost delete {post_id}")
+
+
+def cmd_post(args):
+    # text body: positional words OR "-" for stdin OR empty (image-only)
+    raw_text = args.text or []
+    if raw_text == ["-"]:
+        text = sys.stdin.read().strip()
+    else:
+        text = " ".join(raw_text).strip()
+
+    if not text and not args.image:
+        die('usage: lipost post [--dry-run] [--image PATH [--alt TEXT]] [--queue[-pending]] "text"')
+
+    if args.queue and args.queue_pending:
+        die("--queue and --queue-pending are mutually exclusive")
+
+    queue_mode = bool(args.queue or args.queue_pending)
+    if queue_mode:
+        if args.image:
+            # Image drafts go through the bot's image flow (drafts generate),
+            # not direct enqueue. Refuse with a hint.
+            die("--queue is text-only. For an image post, drop the image into "
+                f"{IMAGES_PENDING}/ and run `lipost drafts generate`.")
+        if args.dry_run:
+            print(f"[dry-run] would enqueue text-only draft "
+                  f"(status={'pending_approval' if args.queue_pending else 'approved'})")
+            print("--- caption ---")
+            print(text)
+            return
+        status = "pending_approval" if args.queue_pending else "approved"
+        slug = create_text_draft(text, source_url=None, model="lipost post --queue", status=status)
+        print(f"queued as draft {slug} (status={status})")
+        if status == "pending_approval":
+            print("review with: lipost drafts review")
+        else:
+            print("see queue with: lipost drafts --status approved")
+        return
+
+    _post_to_linkedin(text, args.image, args.alt, args.dry_run)
+
+
+def cmd_edit(args):
+    urn = args.urn
+    if not urn.startswith("urn:li:"):
+        die(f"expected a LinkedIn URN, got: {urn}")
+    if args.text == ["-"]:
+        text = sys.stdin.read()
+    else:
+        text = " ".join(args.text)
+    text = text.strip()
+    if not text:
+        die("empty new commentary")
+
+    tok = get_token()
+    encoded = urllib.parse.quote(urn, safe="")
+    status, _, body = http_json(
+        "POST", f"https://api.linkedin.com/rest/posts/{encoded}",
+        headers={
+            "Authorization": f"Bearer {tok['access_token']}",
+            "LinkedIn-Version": LINKEDIN_API_VERSION,
+            "X-Restli-Protocol-Version": "2.0.0",
+            "X-RestLi-Method": "PARTIAL_UPDATE",
+        },
+        data={"patch": {"$set": {"commentary": text}}},
+    )
+    if status not in (200, 204):
+        die(f"edit failed (HTTP {status}): {body}")
+    print(f"edited: {urn}")
+    print(f"url:    https://www.linkedin.com/feed/update/{urn}/")
+    print("note: only commentary text is editable; image/visibility cannot be changed after publish.")
+
+
+def cmd_delete(args):
+    urn = args.urn
+    if not urn.startswith("urn:li:"):
+        die(f"expected a LinkedIn URN, got: {urn}")
+    tok = get_token()
+    encoded = urllib.parse.quote(urn, safe="")
+    status, _, body = http_json(
+        "DELETE", f"https://api.linkedin.com/rest/posts/{encoded}",
+        headers={
+            "Authorization": f"Bearer {tok['access_token']}",
+            "LinkedIn-Version": LINKEDIN_API_VERSION,
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+    )
+    if status not in (200, 204):
+        die(f"delete failed (HTTP {status}): {body}")
+    print(f"deleted: {urn}")
+
+
+# ── lipost init: OAuth setup + optional legacy migration ────────────────────
+
+def _pick_symlink_dir():
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    candidates = [
+        os.path.expanduser("~/.local/bin"),
+        os.path.expanduser("~/bin"),
+        "/usr/local/bin",
+    ]
+    for c in candidates:
+        if c in path_dirs and os.path.isdir(c) and os.access(c, os.W_OK):
+            return c
+    for c in candidates:
+        if os.path.isdir(c) and os.access(c, os.W_OK):
+            return c
+    return os.path.expanduser("~/.local/bin")
+
+
+def _migrate_auth_paths_interactive() -> None:
+    """If ~/.config/linkedin-cli/ exists and the new ~/.config/lipost/ doesn't yet
+    have auth/token, offer to move them. Idempotent."""
+    moved_any = False
+    if OLD_AUTH_FILE.exists() and not AUTH_FILE.exists():
+        if _confirm(f"Legacy auth config found at {OLD_AUTH_FILE}. Move to {AUTH_FILE}?"):
+            AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(OLD_AUTH_FILE), str(AUTH_FILE))
+            os.chmod(AUTH_FILE, 0o600)
+            print(f"  moved → {AUTH_FILE}")
+            moved_any = True
+    if OLD_TOKEN_FILE.exists() and not TOKEN_FILE.exists():
+        if _confirm(f"Legacy token found at {OLD_TOKEN_FILE}. Move to {TOKEN_FILE}?"):
+            TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(OLD_TOKEN_FILE), str(TOKEN_FILE))
+            os.chmod(TOKEN_FILE, 0o600)
+            print(f"  moved → {TOKEN_FILE}")
+            moved_any = True
+    if moved_any and OLD_AUTH_DIR.exists():
+        try:
+            OLD_AUTH_DIR.rmdir()
+            print(f"  removed empty {OLD_AUTH_DIR}")
+        except OSError:
+            pass
+
+
+def cmd_init(args):
+    print("lipost setup\n" + "-" * 40)
+    print(
+        "Before continuing you need a LinkedIn developer app:\n"
+        "  1. Go to https://developer.linkedin.com and create an app.\n"
+        "  2. In the Auth tab, add this Authorized redirect URL:\n"
+        f"       {REDIRECT_URI}\n"
+        "  3. In the Products tab, request:\n"
+        "       - Sign In with LinkedIn using OpenID Connect\n"
+        "       - Share on LinkedIn\n"
+        "  4. Copy the Client ID and Client Secret from the Auth tab.\n"
+    )
+
+    _migrate_auth_paths_interactive()
+
+    existing = load_json(AUTH_FILE) or {}
+    if existing.get("client_id"):
+        print(f"Existing config found at {AUTH_FILE}")
+        if _prompt("Overwrite? (y/N)", "N").lower() != "y":
+            print("Keeping existing config.")
+        else:
+            existing = {}
+
+    if not existing.get("client_id"):
+        cid = _prompt("Client ID")
+        if not cid:
+            die("client id is required")
+        csec = _prompt("Client Secret", secret=True)
+        if not csec:
+            die("client secret is required")
+        save_json(AUTH_FILE, {"client_id": cid, "client_secret": csec})
+        print(f"Wrote {AUTH_FILE} (chmod 600)")
+
+    # Optional symlink to put `lipost` on PATH.
+    suggested = _pick_symlink_dir()
+    print()
+    print(f"This script lives at: {SCRIPT_PATH}")
+    if _prompt(f"Create a `lipost` command on your PATH in {suggested}? (Y/n)", "Y").lower() != "n":
+        target_dir = _prompt("Install directory", suggested)
+        target_dir = os.path.expanduser(target_dir)
+        os.makedirs(target_dir, exist_ok=True)
+        link_path = os.path.join(target_dir, "lipost")
+        if os.path.lexists(link_path):
+            if _prompt(f"{link_path} already exists. Overwrite? (y/N)", "N").lower() != "y":
+                print("Skipped symlink.")
+            else:
+                os.remove(link_path)
+                os.symlink(str(SCRIPT_PATH), link_path)
+                print(f"Linked {link_path} -> {SCRIPT_PATH}")
+        else:
+            os.symlink(str(SCRIPT_PATH), link_path)
+            print(f"Linked {link_path} -> {SCRIPT_PATH}")
+        if target_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            print(f"warning: {target_dir} is not on your PATH. Add it to your shell rc, e.g.:")
+            print(f'  export PATH="{target_dir}:$PATH"')
+
+    print()
+    print("Setup complete. Next:")
+    print("  lipost auth     # complete OAuth in your browser")
+    print('  lipost post "hello world"')
+    print()
+    print("Optional layers:")
+    print("  lipost article <url>     # one-shot article-to-post via Claude")
+    print("  lipost bot init          # set up the autonomous poster (macOS launchd)")
+
+
+# ── article skill: URL → Claude → reviewed draft → post ─────────────────────
+
+ARTICLE_WRAPPER = """\
+You are drafting a LinkedIn post that reacts to a specific article. You are
+NOT publishing — your output is a draft the human will review and approve.
+
+Article URL: {url}
+
+Process:
+1. Fetch the article at the URL above using the WebFetch tool. Read it
+   carefully — not just the headline, the actual argument and the specifics.
+2. Find the one non-obvious thing in the article: a mechanism, a tradeoff, a
+   number, a failure mode, an unstated assumption — whatever a reader with
+   real shipping experience would flag. Don't summarize the whole piece.
+   React to one specific thing.
+3. Decide whether the post opens with a heading line. Headings are NOT
+   required on every post — a feed where every post leads with a headline
+   reads like a content-marketing schedule, not a person posting. Use
+   the heading when it earns its place, skip it when it doesn't. Rough
+   rule, tied to the length category you'll pick in step 4:
+
+   - Punchy length: skip the heading. The post itself is the headline.
+   - Short length: skip more often than include (~30% include).
+   - Medium length: include more often than skip (~60% include).
+   - Long length: include almost always (~80% include).
+
+   When you DO include one: write it yourself — do NOT copy the article's
+   actual title verbatim. It should frame your angle on the piece, not be
+   a generic restatement. Sentence case (or Title Case if it reads better),
+   no quotes around it, no trailing period unless it's a complete sentence
+   ending in punctuation, no markdown (no `#`, no `**`), no emoji. Keep it
+   tight — under ~90 characters. Separate it from the body with one blank
+   line. When you SKIP it, the post just opens with the body.
+4. Write the body. Length should vary deliberately — articles can support
+   anything from a single-sentence reaction to 1000+ characters of real
+   engagement with the argument. Don't default to the comfortable
+   3–5 sentence shape; that's the attractor that makes article posts
+   feel like a content-aggregator feed. Pick a length category before
+   writing and commit:
+
+   - Punchy (1–2 sentences, ~50–200 chars): the article surfaces one
+     specific thing worth a reader's time. Say only that.
+   - Short (3–5 sentences, ~200–500 chars): angle plus a beat of context.
+   - Medium (5–9 sentences across 2–3 paragraphs, ~500–900 chars): a
+     walked-through engagement with the argument.
+   - Long (9–18 sentences across 3–5 paragraphs, up to ~1300 chars):
+     a hard-won observation the article supports and which genuinely
+     needs the room to land.
+
+   Skew somewhat longer for articles than for image posts — articles
+   tend to have more content to react to — but never pad. If the angle
+   is thin, the post is short. If the angle is rich, give it the room.
+   Concrete over abstract. Specific over vague. Make a reader who has
+   not read the article curious enough to click — without pitching it.
+5. The caption MUST end with the exact article URL ({url}) on its own line,
+   separated from the body by one blank line (so the JSON string ends with
+   "\\n\\n{url}"). This is a hard requirement, not a suggestion — every
+   caption ends with the URL, every time. Do not omit it. Do not paraphrase
+   it. Do not wrap it in markdown or surrounding punctuation. Do not
+   linkify it manually (LinkedIn auto-linkifies bare URLs). The URL line
+   does not count toward the sentence budget.
+
+Final caption shape (in order, with one blank line between each block).
+Two valid shapes depending on whether you included a heading:
+
+- With heading: heading line → body paragraphs → article URL.
+- Without heading: body paragraphs → article URL.
+
+Output a single JSON object on stdout — and ONLY that JSON object. No
+preamble, no markdown fence, no explanation. One of these two shapes:
+
+{{"caption": "<heading>\\n\\n<body paragraphs>\\n\\n{url}"}}
+{{"caption": "<body paragraphs>\\n\\n{url}"}}
+
+If the article is off-domain, thin, or you'd be repeating yourself:
+
+{{"skip": true, "reason": "<short explanation>"}}
+
+The persona, audience, voice rules, banned phrases, and length rules from
+the persona block below all apply. The image-specific bits in that block
+(the {{{{IMAGE_PATH}}}} placeholder, the Read-the-image step, the "alt"
+field in the output schema) do NOT apply here — this is a text-only post
+about an article you fetched from the web.
+
+--- PERSONA & VOICE ---
+
+{persona}
+
+--- FORMATTING & PUNCTUATION LAYER (mechanical rules; apply on top of voice
+rules above. These describe HOW the text should look, not WHAT to say.) ---
+
+{style}
+"""
+
+
+# Tolerant JSON extractor — Claude sometimes prepends/wraps the object.
+_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
+_JSON_INNER_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+
+def parse_claude_json(stdout: str):
+    s = (stdout or "").strip()
+    if not s:
+        return None
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    # Whole-string-with-DOTALL first (handles JSON containing nested braces).
+    matches = _JSON_OBJ_RE.findall(s)
+    for m in reversed(matches):
+        try:
+            obj = json.loads(m)
+            if isinstance(obj, dict) and ("caption" in obj or "skip" in obj):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    # Fall back to non-greedy inner blocks.
+    matches = _JSON_INNER_RE.findall(s)
+    for m in reversed(matches):
+        try:
+            obj = json.loads(m)
+            if isinstance(obj, dict) and ("caption" in obj or "skip" in obj):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _prompt_state() -> str:
+    """One of: 'missing', 'empty', 'template', 'ready'."""
+    if not PROMPT_FILE.exists():
+        return "missing"
+    text = PROMPT_FILE.read_text().strip()
+    if not text:
+        return "empty"
+    if TEMPLATE_MARKER in text:
+        return "template"
+    return "ready"
+
+
+def _resolve_prompt_for_article() -> str:
+    """Article mode: read PROMPT_FILE as the persona block. Env var override
+    (LIPOST_PROMPT) takes precedence; supports legacy LIPOST_ARTICLE_PROMPT."""
+    override = os.environ.get("LIPOST_PROMPT") or os.environ.get("LIPOST_ARTICLE_PROMPT")
+    target = Path(override).expanduser() if override else PROMPT_FILE
+    if not target.exists():
+        die(f"persona prompt not found: {target}\n"
+            f"Create it (`lipost prompt`), or symlink an existing prompt:\n"
+            f"  ln -s /path/to/your/prompt.md {target}\n"
+            f"or set LIPOST_PROMPT=/path/to/prompt.md")
+    return target.read_text().strip()
+
+
+def _resolve_style_for_article() -> str:
+    """Article mode style: env override OR baked share/style.md (no user_style.md
+    layered in for article — the article wrapper supplies its own context)."""
+    override = os.environ.get("LIPOST_STYLE") or os.environ.get("LIPOST_ARTICLE_STYLE")
+    target = Path(override).expanduser() if override else BAKED_STYLE_FILE
+    if not target.exists():
+        die(f"style guide not found: {target}\n"
+            f"The repo ships {BAKED_STYLE_FILE} — if it's missing, "
+            f"reinstall lipost or set LIPOST_STYLE=/path/to/style.md")
+    return target.read_text().strip()
+
+
+def build_article_prompt(url: str) -> str:
+    return ARTICLE_WRAPPER.format(
+        url=url,
+        persona=_resolve_prompt_for_article(),
+        style=_resolve_style_for_article(),
+    )
+
+
+def run_claude(prompt: str, timeout: int = ARTICLE_TIMEOUT_SECS,
+               permission_mode: str | None = None,
+               model: str = CLAUDE_DEFAULT_MODEL):
+    """Returns (parsed_json_or_None, status_message, raw_stdout)."""
+    claude_path = shutil.which("claude") or shutil.which("claude", path=CRON_PATH)
+    if not claude_path:
+        return None, "claude binary not found on PATH", ""
+    cmd = [claude_path, "-p", prompt, "--model", model]
+    if permission_mode:
+        cmd.extend(["--permission-mode", permission_mode])
+    else:
+        # Article mode used --dangerously-skip-permissions; map to bypassPermissions.
+        cmd.append("--dangerously-skip-permissions")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"claude timed out after {timeout}s", ""
+    if proc.returncode != 0:
+        msg = f"claude rc={proc.returncode}"
+        if proc.stderr:
+            msg += f": {proc.stderr.strip()[:300]}"
+        return None, msg, proc.stdout or ""
+    parsed = parse_claude_json(proc.stdout)
+    if not parsed:
+        tail = proc.stdout.strip()[-300:]
+        return None, f"no valid JSON in claude output (last 300 chars: {tail!r})", proc.stdout
+    return parsed, "ok", proc.stdout
+
+
+def prompt_url() -> str:
+    try:
+        s = input("article URL: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(130)
+    if not s:
+        die("no URL provided")
+    if not URL_RE.match(s):
+        die(f"not a URL: {s}")
+    return s
+
+
+def prompt_choice(options, default):
+    parts = []
+    for k, desc in options.items():
+        parts.append(f"[{k.upper() if k == default else k}]{desc}")
+    line = "  ".join(parts)
+    while True:
+        try:
+            raw = input(f"{line}: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(130)
+        if not raw:
+            return default
+        if raw in options:
+            return raw
+        print(f"  pick one of: {', '.join(options.keys())}")
+
+
+def edit_in_editor(initial: str) -> str:
+    editor = os.environ.get("EDITOR", "vi")
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(initial)
+        tmp = f.name
+    try:
+        rc = subprocess.call([editor, tmp])
+        if rc != 0:
+            print(f"editor exited rc={rc}; keeping original")
+            return initial
+        return Path(tmp).read_text().strip()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+_BAR = "─" * 72
+
+
+def show_draft(caption: str) -> None:
+    print()
+    print(_BAR)
+    print(caption)
+    print(_BAR)
+    print(f"({len(caption)} chars)")
+    print()
+
+
+def _generate_article_once(url: str, extra_steer: str = "") -> dict:
+    prompt = build_article_prompt(url)
+    if extra_steer:
+        prompt += "\n\n--- ADDITIONAL STEERING (from previous round) ---\n\n" + extra_steer
+    print("calling claude (Opus 4.7) — this usually takes 30–90s...", flush=True)
+    parsed, status, _raw = run_claude(prompt)
+    if not parsed:
+        die(f"claude generation failed: {status}")
+    if parsed.get("skip"):
+        die(f"claude skipped: {parsed.get('reason', '(no reason given)')}", code=2)
+    if "caption" not in parsed:
+        die(f"claude returned JSON without a caption: {parsed!r}")
+    return parsed
+
+
+def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: str) -> int:
+    caption = parsed["caption"]
+    while True:
+        show_draft(caption)
+        choice = prompt_choice(
+            {"a": "pprove", "e": "dit", "r": "egenerate", "q": "ueue", "c": "ancel"},
+            default="a",
+        )
+        if choice == "a":
+            print("posting to LinkedIn...")
+            try:
+                _post_to_linkedin(caption, image_path=None, alt_text=None, dry_run=dry_run)
+                return 0
+            except SystemExit as e:
+                return e.code if isinstance(e.code, int) else 1
+        if choice == "q":
+            if dry_run:
+                print(f"[dry-run] would enqueue draft (status={queue_status})")
+                return 0
+            slug = create_text_draft(caption, source_url=url, model="lipost article",
+                                     status=queue_status)
+            print(f"queued as draft {slug} (status={queue_status})")
+            if queue_status == "pending_approval":
+                print("review with: lipost drafts review")
+            else:
+                print("see queue with: lipost drafts --status approved")
+            return 0
+        if choice == "e":
+            edited = edit_in_editor(caption)
+            if not edited:
+                print("(empty after edit; keeping previous draft)")
+                continue
+            caption = edited
+            continue
+        if choice == "r":
+            try:
+                steer = input("steering note for the next draft (optional, enter to skip): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(130)
+            extra = ""
+            if steer:
+                extra = (
+                    "Your previous draft was:\n\n"
+                    + caption
+                    + "\n\nThe human reviewer asked for this change: " + steer
+                )
+            parsed = _generate_article_once(url, extra_steer=extra)
+            caption = parsed["caption"]
+            continue
+        if choice == "c":
+            print("cancelled.")
+            return 0
+
+
+def cmd_article(args):
+    if args.queue and args.queue_pending:
+        die("--queue and --queue-pending are mutually exclusive")
+    url = args.url or prompt_url()
+    if not URL_RE.match(url):
+        die(f"not a URL: {url}")
+    queue_status = "pending_approval" if args.queue_pending else "approved"
+    parsed = _generate_article_once(url)
+    rc = _article_review_loop(url, parsed, dry_run=args.dry_run, queue_status=queue_status)
+    sys.exit(rc)
+
+
+# ── drafts data layer ───────────────────────────────────────────────────────
+
+def make_slug() -> str:
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+    rand = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=6))
+    return f"{ts}_{rand}"
+
+
+def list_drafts(status=None):
+    if not DRAFTS_DIR.exists():
+        return []
+    out = []
+    for sub in sorted(DRAFTS_DIR.iterdir()):
+        if not sub.is_dir():
+            continue
+        meta_path = sub / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        if status and meta.get("status") != status:
+            continue
+        img_filename = meta.get("image_filename")
+        image_path = sub / img_filename if img_filename else None
+        out.append({"slug": sub.name, "dir": sub, "image_path": image_path, "meta": meta})
+    return out
+
+
+def count_drafts_by_status():
+    counts = {s: 0 for s in VALID_DRAFT_STATUSES}
+    for d in list_drafts():
+        s = d["meta"].get("status", "pending_approval")
+        counts[s] = counts.get(s, 0) + 1
+    return counts
+
+
+def create_image_draft(image_src: Path, caption: str, alt_text: str, model: str) -> str:
+    slug = make_slug()
+    draft_dir = DRAFTS_DIR / slug
+    draft_dir.mkdir(parents=True, exist_ok=False)
+
+    image_filename = f"image{image_src.suffix.lower()}"
+    image_dst = draft_dir / image_filename
+    image_src.rename(image_dst)
+
+    meta = {
+        "slug": slug,
+        "status": "pending_approval",
+        "caption": caption.strip(),
+        "alt_text": (alt_text or "").strip(),
+        "image_filename": image_filename,
+        "source_filename": image_src.name,
+        "source_url": None,
+        "created_at": now_iso(),
+        "approved_at": None,
+        "rejected_at": None,
+        "posted_at": None,
+        "urn": None,
+        "model": model,
+    }
+    (draft_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    return slug
+
+
+def create_text_draft(caption, *, source_url=None, model="external",
+                      status="pending_approval", approved_now=False) -> str:
+    if status not in VALID_DRAFT_STATUSES:
+        raise ValueError(f"invalid status: {status}")
+    slug = make_slug()
+    draft_dir = DRAFTS_DIR / slug
+    draft_dir.mkdir(parents=True, exist_ok=False)
+    meta = {
+        "slug": slug,
+        "status": status,
+        "caption": caption.strip(),
+        "alt_text": "",
+        "image_filename": None,
+        "source_filename": None,
+        "source_url": source_url,
+        "created_at": now_iso(),
+        "approved_at": now_iso() if (status == "approved" or approved_now) else None,
+        "rejected_at": None,
+        "posted_at": None,
+        "urn": None,
+        "model": model,
+    }
+    (draft_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    return slug
+
+
+def update_draft(slug: str, **changes) -> None:
+    meta_path = DRAFTS_DIR / slug / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta.update(changes)
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+
+
+def list_pending_images():
+    if not IMAGES_PENDING.exists():
+        return []
+    return sorted(p for p in IMAGES_PENDING.iterdir()
+                  if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+
+
+def park_skipped_image(img: Path, reason: str) -> Path:
+    IMAGES_SKIPPED.mkdir(parents=True, exist_ok=True)
+    dest = IMAGES_SKIPPED / img.name
+    if dest.exists():
+        stem, suffix = dest.stem, dest.suffix
+        dest = IMAGES_SKIPPED / f"{stem}_{make_slug()[:8]}{suffix}"
+    img.rename(dest)
+    (dest.with_suffix(dest.suffix + ".reason.txt")).write_text(f"{now_iso()}\n{reason}\n")
+    return dest
+
+
+# ── style layer (used by image generation; NOT layered into article wrapper) ─
+
+def get_style_layer() -> str:
+    """Return the combined baked + user style layer for IMAGE generation."""
+    parts = []
+    if BAKED_STYLE_FILE.exists():
+        baked = BAKED_STYLE_FILE.read_text().strip()
+        if baked:
+            parts.append(baked)
+    if USER_STYLE_FILE.exists():
+        user = USER_STYLE_FILE.read_text().strip()
+        if user:
+            parts.append("# User additions\n\n" + user)
+    if not parts:
+        return ""
+    return (
+        "\n\n---\n"
+        "FORMATTING & PUNCTUATION LAYER (mechanical rules; apply on top of the voice "
+        "rules above. These describe HOW the text should look, not WHAT to say.):\n\n"
+        + "\n\n".join(parts)
+    )
+
+
+# ── image generation (cmd_generate) ─────────────────────────────────────────
+
+def _invoke_claude_on_image(image_path: Path, cfg, extra_context: str = ""):
+    if _prompt_state() != "ready":
+        return None, f"prompt not ready (state={_prompt_state()})"
+
+    prompt_template = PROMPT_FILE.read_text()
+    if IMAGE_PLACEHOLDER not in prompt_template:
+        return None, f"prompt has no {IMAGE_PLACEHOLDER} placeholder"
+
+    prompt_text = prompt_template.replace(IMAGE_PLACEHOLDER, str(image_path.resolve()))
+    prompt_text += get_style_layer()
+    if extra_context:
+        prompt_text += "\n\n" + extra_context
+
+    claude_path = shutil.which("claude") or shutil.which("claude", path=CRON_PATH) or "claude"
+    try:
+        proc = subprocess.run(
+            [claude_path, "-p", prompt_text,
+             "--permission-mode", cfg["permission_mode"],
+             "--model", cfg["claude_model"]],
+            capture_output=True, text=True, timeout=GENERATE_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "claude timed out after 10m"
+
+    if proc.returncode != 0:
+        msg = f"claude rc={proc.returncode}"
+        if proc.stderr:
+            msg += f": {proc.stderr.strip()[:200]}"
+        return None, msg
+
+    parsed = parse_claude_json(proc.stdout)
+    if not parsed:
+        return None, f"no valid JSON in output (last 200 chars: {proc.stdout.strip()[-200:]!r})"
+    return parsed, "ok"
+
+
+def check_dependencies():
+    problems = []
+    if shutil.which("claude") is None and shutil.which("claude", path=CRON_PATH) is None:
+        problems.append(
+            "`claude` (Claude Code CLI) not found on PATH. Install from "
+            "https://docs.claude.com/en/docs/claude-code"
+        )
+    have_auth = AUTH_FILE.exists() or OLD_AUTH_FILE.exists()
+    have_token = TOKEN_FILE.exists() or OLD_TOKEN_FILE.exists()
+    if not have_auth:
+        problems.append(f"missing {AUTH_FILE} — run `lipost init` to write LinkedIn credentials.")
+    if not have_token:
+        problems.append(f"missing {TOKEN_FILE} — run `lipost auth` to OAuth into LinkedIn.")
+    return (not problems, problems)
+
+
+def check_claude_auth(cfg):
+    """Smoke-test claude with a tiny prompt to catch missing-login / wrong-model."""
+    claude_path = shutil.which("claude") or shutil.which("claude", path=CRON_PATH)
+    if not claude_path:
+        return False, "claude binary not found on PATH"
+    try:
+        proc = subprocess.run(
+            [claude_path, "-p", "respond with the single word: ok",
+             "--permission-mode", cfg["permission_mode"],
+             "--model", cfg["claude_model"]],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "claude smoke test timed out after 60s"
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip()
+        if not msg:
+            msg = f"rc={proc.returncode} (no output)"
+        return False, msg[:500]
+    return True, "ok"
+
+
+def cmd_generate(args):
+    cfg = get_bot_config()
+
+    ok, problems = check_dependencies()
+    if not ok:
+        print("dependency check failed:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        sys.exit(1)
+
+    pstate = _prompt_state()
+    if pstate != "ready":
+        print(f"prompt is not ready: {pstate}.", file=sys.stderr)
+        print(f"edit {PROMPT_FILE} (or `lipost prompt`) and remove the TEMPLATE marker.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    prompt_template = PROMPT_FILE.read_text()
+    if IMAGE_PLACEHOLDER not in prompt_template:
+        print(f"prompt has no {IMAGE_PLACEHOLDER} placeholder; image-mode is required for "
+              f"`drafts generate`.", file=sys.stderr)
+        sys.exit(1)
+
+    pending = list_pending_images()
+    if not pending:
+        print(f"no images in {IMAGES_PENDING}.")
+        print(f"drop JPEG/PNG/GIF files there or open with: lipost images --open")
+        return
+
+    print(f"checking claude auth ({cfg['claude_model']})...", flush=True)
+    auth_ok, auth_msg = check_claude_auth(cfg)
+    if not auth_ok:
+        print(f"claude smoke test failed: {auth_msg}", file=sys.stderr)
+        print("likely fixes: run `claude /login` in this shell, or set ANTHROPIC_API_KEY.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"generating drafts for {len(pending)} image(s) using {cfg['claude_model']}...")
+    print("each call may take 10–60s. Press Ctrl-C to abort (in-progress image will be left in pending/).\n")
+
+    saved = skipped = failed = 0
+    for i, img in enumerate(pending, 1):
+        print(f"[{i}/{len(pending)}] {img.name}", flush=True)
+        try:
+            parsed, info = _invoke_claude_on_image(img, cfg)
+        except KeyboardInterrupt:
+            print("\naborted by user.")
+            break
+
+        if parsed is None:
+            print(f"  ✗ {info}")
+            failed += 1
+            continue
+
+        if parsed.get("skip"):
+            reason = parsed.get("reason", "(no reason given)")
+            print(f"  → SKIP: {reason}")
+            park_skipped_image(img, reason)
+            skipped += 1
+            continue
+
+        caption = (parsed.get("caption") or "").strip()
+        alt = (parsed.get("alt") or parsed.get("alt_text") or "").strip()
+        if not caption:
+            print(f"  ✗ JSON has no caption: {parsed}")
+            failed += 1
+            continue
+
+        slug = create_image_draft(img, caption, alt, cfg["claude_model"])
+        preview = caption[:80] + ("…" if len(caption) > 80 else "")
+        print(f"  ✓ draft {slug}")
+        print(f"    {preview}")
+        saved += 1
+
+    print(f"\ndone. saved={saved}, skipped={skipped}, failed={failed}.")
+    if saved:
+        print("review with: lipost drafts review")
+
+
+# ── review TUI ──────────────────────────────────────────────────────────────
+
+_EDIT_TEMPLATE = """# Edit caption and alt text below. Save and quit when done.
+# Anything outside the >>> / <<< markers is ignored.
+# Leave a section's content empty to clear it.
+
+CAPTION>>>
+{caption}
+<<<CAPTION
+
+ALT>>>
+{alt}
+<<<ALT
+"""
+
+_SECTION_RE_TEMPLATE = r"{name}>>>\s*\n(.*?)\n<<<{name}"
+
+
+def _edit_draft_text(draft):
+    meta = draft["meta"]
+    body = _EDIT_TEMPLATE.format(caption=meta.get("caption", ""), alt=meta.get("alt_text", ""))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tf:
+        tf.write(body)
+        tmp = tf.name
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.call([editor, tmp])
+    text = Path(tmp).read_text()
+    Path(tmp).unlink(missing_ok=True)
+
+    cap_m = re.search(_SECTION_RE_TEMPLATE.format(name="CAPTION"), text, re.DOTALL)
+    alt_m = re.search(_SECTION_RE_TEMPLATE.format(name="ALT"), text, re.DOTALL)
+    if not cap_m or not alt_m:
+        print("  ✗ failed to parse edited file (CAPTION/ALT markers missing). no changes made.")
+        input("  [enter] to continue ")
+        return
+    new_cap = cap_m.group(1).strip()
+    new_alt = alt_m.group(1).strip()
+    if not new_cap:
+        print("  ✗ caption is empty. no changes made.")
+        input("  [enter] to continue ")
+        return
+    update_draft(draft["slug"], caption=new_cap, alt_text=new_alt)
+    draft["meta"]["caption"] = new_cap
+    draft["meta"]["alt_text"] = new_alt
+    print("  ✓ updated")
+
+
+def _regenerate_image_draft(draft):
+    meta = draft["meta"]
+    if not meta.get("image_filename"):
+        print()
+        print("  ✗ regenerate is image-only at the moment. For text-only drafts,")
+        print("    re-run the source tool (e.g. `lipost article <url>`) to produce")
+        print("    a fresh draft, or use [e]dit to revise this one in place.")
+        input("  [enter] to continue ")
+        return
+
+    print()
+    print("guidance for the rewrite (e.g. 'make it shorter' / 'less corporate' / "
+          "'lead with the failure mode')")
+    print("press enter alone for no specific feedback (Claude will still see the previous draft).")
+    feedback = input("> ").strip()
+
+    if not draft["image_path"] or not draft["image_path"].exists():
+        print(f"  ✗ image missing: {draft['image_path']}")
+        input("  [enter] to continue ")
+        return
+
+    extra = (
+        "PREVIOUS DRAFT FOR THIS IMAGE (revise; do NOT just repeat the same wording):\n"
+        f"caption: {meta.get('caption', '(none)')}\n"
+        f"alt: {meta.get('alt_text', '(none)')}\n"
+    )
+    if feedback:
+        extra += f"\nUSER FEEDBACK ON THE PREVIOUS DRAFT:\n{feedback}\n"
+    extra += ("\nProduce a NEW caption + alt that addresses the feedback (or, with no feedback, "
+              "that's a meaningfully different angle). Output the same JSON shape: "
+              '{"caption": ..., "alt": ...}.')
+
+    cfg = get_bot_config()
+    print(f"  invoking claude on {draft['image_path'].name}... (10–60s)", flush=True)
+    parsed, info = _invoke_claude_on_image(draft["image_path"], cfg, extra_context=extra)
+    if parsed is None:
+        print(f"  ✗ regenerate failed: {info}")
+        print("    (your draft is unchanged.)")
+        input("  [enter] to continue ")
+        return
+
+    if parsed.get("skip"):
+        reason = parsed.get("reason", "(no reason)")
+        print(f"  → claude returned SKIP: {reason}")
+        print("    (draft unchanged. you can still approve / reject / edit manually.)")
+        input("  [enter] to continue ")
+        return
+
+    new_cap = (parsed.get("caption") or "").strip()
+    new_alt = (parsed.get("alt") or parsed.get("alt_text") or "").strip()
+    if not new_cap:
+        print(f"  ✗ regenerate produced no caption (parsed: {parsed})")
+        input("  [enter] to continue ")
+        return
+
+    update_draft(draft["slug"], caption=new_cap, alt_text=new_alt)
+    draft["meta"]["caption"] = new_cap
+    draft["meta"]["alt_text"] = new_alt
+    print("  ✓ rewritten. (loop back to view)")
+    input("  [enter] to continue ")
+
+
+def _review_one(draft, i, total):
+    while True:
+        print("\033[2J\033[H", end="")  # clear screen, home cursor
+        meta = draft["meta"]
+        is_text_only = not meta.get("image_filename")
+        kind = "text-only" if is_text_only else "image"
+        print(f"━━━ draft {i}/{total} ({kind}) ━━━")
+        print(f"slug:     {draft['slug']}")
+        print(f"created:  {meta.get('created_at', '?')}")
+        if is_text_only:
+            src_url = meta.get("source_url")
+            print(f"source:   {src_url or '(none)'}  (model: {meta.get('model', '?')})")
+        else:
+            print(f"source:   {meta.get('source_filename', '?')}  (model: {meta.get('model', '?')})")
+            print(f"image:    {draft['image_path']}")
+        print()
+        print("caption:")
+        for line in (meta.get("caption") or "").splitlines() or [""]:
+            print(f"  {line}")
+        print()
+        if not is_text_only:
+            print("alt:")
+            print(f"  {meta.get('alt_text', '')}")
+            print()
+
+        choice = input("[a]pprove  [r]eject  [e]dit  [g]enerate-again  [s]kip  [q]uit > ").strip().lower()
+        if choice in ("a", "approve"):
+            update_draft(draft["slug"], status="approved", approved_at=now_iso())
+            print("  ✓ approved")
+            return "next"
+        elif choice in ("r", "reject"):
+            update_draft(draft["slug"], status="rejected", rejected_at=now_iso())
+            print("  ✗ rejected")
+            return "next"
+        elif choice in ("s", "skip"):
+            print("  → skipped (still pending_approval)")
+            return "next"
+        elif choice in ("q", "quit"):
+            return "quit"
+        elif choice in ("e", "edit"):
+            _edit_draft_text(draft)
+        elif choice in ("g", "generate", "regenerate"):
+            _regenerate_image_draft(draft)
+        else:
+            print(f"  unknown choice '{choice}', try again.")
+            input("  [enter] to continue ")
+
+
+def cmd_review(args):
+    drafts = list_drafts(status="pending_approval")
+    drafts.sort(key=lambda d: d["meta"].get("created_at") or "")
+
+    if not drafts:
+        print("no drafts pending approval.")
+        counts = count_drafts_by_status()
+        print(f"queue: pending={counts['pending_approval']}, approved={counts['approved']}, "
+              f"rejected={counts['rejected']}, posted={counts['posted']}")
+        return
+
+    print(f"{len(drafts)} draft(s) pending approval. Press q at any prompt to stop.\n")
+    for i, draft in enumerate(drafts, 1):
+        action = _review_one(draft, i, len(drafts))
+        if action == "quit":
+            print(f"\nstopped. {len(drafts) - i + 1} remaining drafts left as pending_approval.")
+            break
+
+    counts = count_drafts_by_status()
+    print(f"\nqueue: pending={counts['pending_approval']}, approved={counts['approved']}, "
+          f"rejected={counts['rejected']}, posted={counts['posted']}")
+
+
+# ── drafts subcommands: list, add, run ──────────────────────────────────────
+
+def cmd_drafts_list(args):
+    all_drafts = list_drafts()
+    if args.status:
+        if args.status not in VALID_DRAFT_STATUSES:
+            print(f"unknown status '{args.status}'. valid: {', '.join(sorted(VALID_DRAFT_STATUSES))}",
+                  file=sys.stderr)
+            sys.exit(1)
+        all_drafts = [d for d in all_drafts if d["meta"].get("status") == args.status]
+
+    if not all_drafts:
+        print("no drafts." if not args.status else f"no drafts with status={args.status}.")
+        return
+
+    by_status = {}
+    for d in all_drafts:
+        by_status.setdefault(d["meta"].get("status", "pending_approval"), []).append(d)
+
+    order = ["pending_approval", "approved", "posted", "rejected"]
+    for status in order:
+        if status not in by_status:
+            continue
+        items = by_status[status]
+        items.sort(key=lambda d: d["meta"].get("created_at") or "", reverse=True)
+        print(f"\n{status} ({len(items)}):")
+        for d in items[:args.limit]:
+            meta = d["meta"]
+            cap = (meta.get("caption") or "").replace("\n", " ")
+            cap = cap[:70] + ("…" if len(cap) > 70 else "")
+            print(f"  {d['slug']}  {cap}")
+        if len(items) > args.limit:
+            print(f"  … {len(items) - args.limit} older")
+
+
+def cmd_drafts_add(args):
+    if args.text is None or args.text == "-":
+        if sys.stdin.isatty():
+            die("pass caption as --text VALUE or pipe via stdin (got neither)")
+        caption = sys.stdin.read()
+    else:
+        caption = args.text
+
+    caption = (caption or "").strip()
+    if not caption:
+        die("empty caption")
+
+    if args.status not in {"approved", "pending_approval"}:
+        die(f"--status must be 'approved' or 'pending_approval' (got {args.status!r})")
+
+    slug = create_text_draft(caption, source_url=args.source,
+                             model=args.model or "external", status=args.status)
+    print(slug)
+
+
+def _next_approved_draft():
+    approved = list_drafts(status="approved")
+    if not approved:
+        return None
+    approved.sort(key=lambda d: d["meta"].get("approved_at") or d["meta"].get("created_at") or "")
+    return approved[0]
+
+
+def _print_dry_plan():
+    cfg = get_bot_config()
+    state = get_bot_state()
+    deps_ok, deps_problems = check_dependencies()
+    self_path = shutil.which("lipost", path=CRON_PATH) or str(BIN_LINK) or "<not found on CRON_PATH>"
+
+    last = parse_iso(state.get("last_run_at"))
+    gap_h = hours_since(last)
+    next_draft = _next_approved_draft()
+    counts = count_drafts_by_status()
+
+    print("=== lipost drafts run --no-fire ===\n")
+    print("would skip due to: ", end="")
+    reasons = []
+    if not cfg.get("active", False):
+        reasons.append("inactive (config.active=false)")
+    if state.get("paused"):
+        reasons.append("paused")
+    if gap_h is not None and gap_h < cfg["min_hours_between_runs"]:
+        reasons.append(f"min-gap ({gap_h:.1f}h < {cfg['min_hours_between_runs']}h)")
+    if next_draft is None:
+        reasons.append("no approved drafts in queue")
+    if not deps_ok:
+        reasons.append("dependency check")
+    print(", ".join(reasons) if reasons else "(nothing — would post)")
+    if reasons:
+        print("  note: `drafts run` ignores `active`, `paused`, and the min-gap guard at runtime; "
+              "`_cron` (launchd) honors all three. The queue-empty case is honored by both.")
+    print()
+
+    print(f"queue:         approved={counts['approved']}, pending={counts['pending_approval']}, "
+          f"rejected={counts['rejected']}, posted={counts['posted']}")
+    if next_draft is not None:
+        meta = next_draft["meta"]
+        cap = (meta.get("caption") or "").replace("\n", " ")
+        cap_preview = cap[:120] + ("…" if len(cap) > 120 else "")
+        is_text_only = not meta.get("image_filename")
+        print(f"next draft:    {next_draft['slug']} ({'text-only' if is_text_only else 'image'})")
+        print(f"  approved at: {meta.get('approved_at') or '?'}")
+        if is_text_only:
+            print(f"  source url:  {meta.get('source_url') or '(none)'}")
+        else:
+            print(f"  image:       {next_draft['image_path']}")
+            print(f"  alt:         {meta.get('alt_text', '')}")
+        print(f"  caption:     {cap_preview}")
+    print()
+
+    print(f"binary:        {self_path}")
+    print(f"PATH (cron):   {CRON_PATH}")
+    print(f"timeout:       5 min (LinkedIn POST)")
+    print()
+
+    if deps_problems:
+        print("dependency problems:")
+        for p in deps_problems:
+            print(f"  - {p}")
+        print()
+
+
+def cmd_drafts_run(args):
+    if args.no_fire:
+        _print_dry_plan()
+        return
+    print("running now (no jitter, ignoring active/pause/gap guards)...")
+    _do_post_run(force=True)
+
+
+# ── bot config / state / launchd plumbing ───────────────────────────────────
+
+def get_bot_config():
+    """Read bot config; fall back to legacy ~/.config/lipost-bot/config.json."""
+    cfg = load_json(BOT_CONFIG_FILE) or load_json(OLD_BOT_CONFIG_FILE) or {}
+    return {**DEFAULT_BOT_CONFIG, **cfg}
+
+
+def get_bot_state():
+    state = load_json(BOT_STATE_FILE) or load_json(OLD_BOT_STATE_FILE) or {}
+    return {**{"last_run_at": None, "paused": False}, **state}
+
+
+def save_bot_state(state) -> None:
+    save_json(BOT_STATE_FILE, state)
+
+
+def launchctl_loaded(label: str) -> bool:
+    r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+    return any(line.split("\t")[-1] == label for line in r.stdout.splitlines())
+
+
+def write_post_plist(cfg) -> None:
+    LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
+    program = str(SCRIPT_PATH)
+    plist = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LABEL_POST}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{program}</string>
+        <string>_cron</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{int(cfg["baseline_hour"])}</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{LOG_FILE}</string>
+    <key>StandardErrorPath</key>
+    <string>{LOG_FILE}</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+'''
+    PLIST_POST_SRC.write_text(plist)
+
+
+def write_generate_plist(cfg) -> None:
+    LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
+    program = str(SCRIPT_PATH)
+    interval_secs = int(cfg.get("generate_interval_hours", 8)) * 3600
+    plist = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LABEL_GENERATE}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{program}</string>
+        <string>_cron_generate</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>{interval_secs}</integer>
+    <key>StandardOutPath</key>
+    <string>{LOG_FILE}</string>
+    <key>StandardErrorPath</key>
+    <string>{LOG_FILE}</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+'''
+    PLIST_GEN_SRC.write_text(plist)
+
+
+def _unload_old_lipost_bot_jobs() -> None:
+    """Best-effort unload + cleanup of the old `local.lipost-bot.*` launchd jobs.
+    Lets `lipost bot init` rotate users from the old binary cleanly."""
+    for lbl, dst in ((OLD_LABEL_POST, OLD_PLIST_POST_DEST),
+                     (OLD_LABEL_GENERATE, OLD_PLIST_GEN_DEST)):
+        if launchctl_loaded(lbl):
+            subprocess.run(["launchctl", "unload", str(dst)], capture_output=True)
+            print(f"  unloaded legacy launchd job: {lbl}")
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+            print(f"  removed legacy plist symlink: {dst}")
+    if OLD_BIN_LINK.is_symlink() or OLD_BIN_LINK.exists():
+        # only remove if it's a stale symlink to a nonexistent/old script
+        try:
+            target = OLD_BIN_LINK.resolve(strict=False)
+            if not target.exists() or target.name == "lipost-bot":
+                OLD_BIN_LINK.unlink()
+                print(f"  removed legacy bin symlink: {OLD_BIN_LINK}")
+        except OSError:
+            pass
+
+
+def _migrate_bot_paths_interactive() -> None:
+    """Move legacy ~/.config/lipost-bot/, drafts/, images/, prompt.md into new
+    standardized locations. Idempotent and prompted."""
+    moved_any = False
+
+    # Config / state / posts.jsonl
+    for old, new, label in (
+        (OLD_BOT_CONFIG_FILE, BOT_CONFIG_FILE, "bot config"),
+        (OLD_BOT_STATE_FILE, BOT_STATE_FILE, "bot state"),
+        (OLD_BOT_POSTS_FILE, POSTS_FILE, "post history"),
+    ):
+        if old.exists() and not new.exists():
+            if _confirm(f"Legacy {label} found at {old}. Move to {new}?"):
+                new.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old), str(new))
+                if new.name in ("bot.json", "state.json"):
+                    os.chmod(new, 0o600)
+                print(f"  moved → {new}")
+                moved_any = True
+
+    # Old log file → new log file
+    if OLD_BOT_LOG.exists() and not LOG_FILE.exists():
+        if _confirm(f"Legacy log at {OLD_BOT_LOG}. Move to {LOG_FILE}?"):
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(OLD_BOT_LOG), str(LOG_FILE))
+            print(f"  moved → {LOG_FILE}")
+
+    if moved_any and OLD_BOT_DIR.exists():
+        try:
+            OLD_BOT_DIR.rmdir()
+            print(f"  removed empty {OLD_BOT_DIR}")
+        except OSError:
+            pass
+
+    # Drafts / images / prompt.md / user_style.md from a likely repo location
+    for guess in OLD_BOT_REPO_GUESSES:
+        if not guess.exists():
+            continue
+        old_drafts = guess / "drafts"
+        old_images = guess / "images"
+        old_prompt = guess / "prompt.md"
+        old_user_style = guess / "user_style.md"
+
+        if old_prompt.exists() and not PROMPT_FILE.exists():
+            if _confirm(f"Legacy prompt at {old_prompt}. Move to {PROMPT_FILE}?"):
+                PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old_prompt), str(PROMPT_FILE))
+                print(f"  moved → {PROMPT_FILE}")
+
+        if old_user_style.exists() and not USER_STYLE_FILE.exists():
+            if _confirm(f"Legacy user_style.md at {old_user_style}. Move to {USER_STYLE_FILE}?"):
+                USER_STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old_user_style), str(USER_STYLE_FILE))
+                print(f"  moved → {USER_STYLE_FILE}")
+
+        if old_drafts.exists() and not DRAFTS_DIR.exists():
+            if _confirm(f"Legacy drafts dir at {old_drafts}. Move to {DRAFTS_DIR}?"):
+                DRAFTS_DIR.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old_drafts), str(DRAFTS_DIR))
+                print(f"  moved → {DRAFTS_DIR}")
+
+        if old_images.exists() and not IMAGES_DIR.exists():
+            if _confirm(f"Legacy images dir at {old_images}. Move to {IMAGES_DIR}?"):
+                IMAGES_DIR.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old_images), str(IMAGES_DIR))
+                print(f"  moved → {IMAGES_DIR}")
+
+
+# ── bot subcommands ─────────────────────────────────────────────────────────
+
+def cmd_bot_init(args):
+    ok, problems = check_dependencies()
+    if not ok:
+        print("lipost bot has unmet dependencies:\n", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        print("\nFix these and re-run `lipost bot init`. (Pass --force to skip this check.)",
+              file=sys.stderr)
+        if not getattr(args, "force", False):
+            sys.exit(1)
+        print("(--force given; continuing anyway.)\n", file=sys.stderr)
+
+    print("Migrating any legacy state from the old standalone lipost-bot install...")
+    _unload_old_lipost_bot_jobs()
+    _migrate_bot_paths_interactive()
+    print()
+
+    cfg = get_bot_config()
+    print("lipost bot init — press enter to keep current/default values.\n")
+
+    def ask(prompt, current, cast=str):
+        s = input(f"{prompt} [{current}]: ").strip()
+        return cast(s) if s else current
+
+    cfg["baseline_hour"] = ask("Baseline hour (0–23, when launchd fires before jitter)",
+                               cfg["baseline_hour"], int)
+    jitter_h = ask("Jitter window in hours (max delay after baseline)",
+                   cfg["jitter_max_secs"] // 3600, int)
+    cfg["jitter_max_secs"] = jitter_h * 3600
+    cfg["min_hours_between_runs"] = ask("Minimum hours between runs",
+                                        cfg["min_hours_between_runs"], int)
+    cfg["permission_mode"] = ask("Claude permission mode", cfg["permission_mode"])
+
+    # Always start inert.
+    cfg["active"] = False
+
+    save_json(BOT_CONFIG_FILE, cfg)
+    print(f"\nWrote {BOT_CONFIG_FILE}")
+    print("\nactive=false (bot is inert). When ready, arm with:")
+    print("    lipost bot config active true")
+
+    # Create user-data dirs.
+    IMAGES_PENDING.mkdir(parents=True, exist_ok=True)
+    IMAGES_SKIPPED.mkdir(parents=True, exist_ok=True)
+    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Drop images into {IMAGES_PENDING}/ — `lipost drafts generate` will drain them.")
+
+    # Seed prompt.md from the example so first-run users have a working template.
+    if EXAMPLE_PROMPT_FILE.exists() and not PROMPT_FILE.exists():
+        PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PROMPT_FILE.write_text(EXAMPLE_PROMPT_FILE.read_text())
+        print(f"Seeded {PROMPT_FILE} from prompt.example.md (TEMPLATE marker on line 1; "
+              "remove it before going live).")
+
+    # Symlink binary onto PATH (idempotent).
+    BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
+    if BIN_LINK.is_symlink() or BIN_LINK.exists():
+        BIN_LINK.unlink()
+    BIN_LINK.symlink_to(SCRIPT_PATH)
+    print(f"Symlinked {BIN_LINK} → {SCRIPT_PATH}")
+
+    # Write & install plists.
+    write_post_plist(cfg)
+    write_generate_plist(cfg)
+    PLIST_POST_DEST.parent.mkdir(parents=True, exist_ok=True)
+    for src, dst in ((PLIST_POST_SRC, PLIST_POST_DEST), (PLIST_GEN_SRC, PLIST_GEN_DEST)):
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+        dst.symlink_to(src)
+
+    subprocess.run(["launchctl", "unload", str(PLIST_POST_DEST)], capture_output=True)
+    r = subprocess.run(["launchctl", "load", "-w", str(PLIST_POST_DEST)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"launchctl load failed (post): {r.stderr}", file=sys.stderr)
+    else:
+        print(f"Loaded {LABEL_POST} (POST cron — baseline {cfg['baseline_hour']:02d}:00, "
+              f"jitter ≤ {jitter_h}h)")
+
+    subprocess.run(["launchctl", "unload", str(PLIST_GEN_DEST)], capture_output=True)
+    r = subprocess.run(["launchctl", "load", "-w", str(PLIST_GEN_DEST)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"launchctl load failed (generate): {r.stderr}", file=sys.stderr)
+    else:
+        print(f"Loaded {LABEL_GENERATE} (GENERATE cron — every {cfg['generate_interval_hours']}h)")
+    print("\nNote: both crons are inert until you set `active=true` and/or `generate_active=true`.")
+
+    pstate = _prompt_state()
+    if pstate == "missing":
+        print(f"\nReminder: {PROMPT_FILE} is missing — `lipost drafts generate` will refuse "
+              "to run until it exists.")
+    elif pstate == "empty":
+        print(f"\nReminder: {PROMPT_FILE} is empty — `lipost drafts generate` will refuse "
+              "to run until you fill it.")
+    elif pstate == "template":
+        print(f"\nReminder: {PROMPT_FILE} still has the TEMPLATE marker — "
+              "`lipost drafts generate` will refuse to run until you remove line 1.")
+
+
+def cmd_bot_config(args):
+    cfg = get_bot_config()
+    if not args.key:
+        for k, v in cfg.items():
+            print(f"{k} = {v}")
+        return
+
+    if args.key not in DEFAULT_BOT_CONFIG:
+        print(f"unknown key: {args.key}", file=sys.stderr)
+        print(f"valid keys: {', '.join(DEFAULT_BOT_CONFIG)}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.value is None:
+        print(f"{args.key} = {cfg[args.key]}")
+        return
+
+    target_type = type(DEFAULT_BOT_CONFIG[args.key])
+    if target_type is bool:
+        v = args.value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            new_val = True
+        elif v in ("false", "0", "no", "off"):
+            new_val = False
+        else:
+            die(f"invalid value for {args.key}: expected true/false")
+    else:
+        try:
+            new_val = target_type(args.value)
+        except ValueError:
+            die(f"invalid value for {args.key}: expected {target_type.__name__}")
+
+    if args.key == "baseline_hour" and not (0 <= new_val <= 23):
+        die("baseline_hour must be 0–23")
+    if args.key == "jitter_max_secs" and new_val < 0:
+        die("jitter_max_secs must be ≥ 0")
+    if args.key == "generate_interval_hours" and new_val < 1:
+        die("generate_interval_hours must be ≥ 1")
+
+    cfg[args.key] = new_val
+    save_json(BOT_CONFIG_FILE, cfg)
+    print(f"set {args.key} = {new_val}")
+
+    if args.key == "baseline_hour":
+        write_post_plist(cfg)
+        if launchctl_loaded(LABEL_POST):
+            subprocess.run(["launchctl", "unload", str(PLIST_POST_DEST)], capture_output=True)
+            subprocess.run(["launchctl", "load", "-w", str(PLIST_POST_DEST)], capture_output=True)
+            print(f"reloaded post launchd job (new baseline {new_val:02d}:00)")
+    if args.key == "generate_interval_hours":
+        write_generate_plist(cfg)
+        if launchctl_loaded(LABEL_GENERATE):
+            subprocess.run(["launchctl", "unload", str(PLIST_GEN_DEST)], capture_output=True)
+            subprocess.run(["launchctl", "load", "-w", str(PLIST_GEN_DEST)], capture_output=True)
+            print(f"reloaded generate launchd job (new interval {new_val}h)")
+
+
+def next_window_str(cfg, last):
+    now = datetime.now().astimezone()
+    today_baseline = now.replace(hour=cfg["baseline_hour"], minute=0, second=0, microsecond=0)
+    jitter_h = cfg["jitter_max_secs"] / 3600
+    today_end = today_baseline + timedelta(seconds=cfg["jitter_max_secs"])
+    if now > today_end or (last and last >= today_baseline.astimezone(timezone.utc)):
+        base = today_baseline + timedelta(days=1)
+    else:
+        base = today_baseline
+    end = base + timedelta(seconds=cfg["jitter_max_secs"])
+    return f"{base.strftime('%Y-%m-%d %H:%M')} – {end.strftime('%H:%M')} (window {jitter_h:g}h)"
+
+
+def count_posts_since(cutoff):
+    if not POSTS_FILE.exists():
+        return 0
+    n = 0
+    for line in POSTS_FILE.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+            t = parse_iso(entry.get("posted_at"))
+            if t and t >= cutoff:
+                n += 1
+        except json.JSONDecodeError:
+            continue
+    return n
+
+
+def cmd_bot_status(args):
+    cfg = get_bot_config()
+    state = get_bot_state()
+    loaded = launchctl_loaded(LABEL_POST)
+
+    last = parse_iso(state.get("last_run_at"))
+    last_str = fmt_local(last) if last else "never"
+    last_ago = hours_since(last)
+    last_ago_str = f" ({last_ago:.1f}h ago)" if last_ago is not None else ""
+
+    posts_7d = count_posts_since(datetime.now(timezone.utc) - timedelta(days=7))
+    deps_ok, deps_problems = check_dependencies()
+
+    active = cfg.get("active", False)
+    gen_active = cfg.get("generate_active", False)
+    gen_loaded = launchctl_loaded(LABEL_GENERATE)
+    print(f"  active:     {active}"
+          f"{'' if active else '  ← inert; activate with: lipost bot config active true'}  "
+          "(post cron)")
+    print(f"  gen-active: {gen_active}"
+          f"{'' if gen_active else '  ← off; turn on with: lipost bot config generate_active true'}  "
+          f"(every {cfg.get('generate_interval_hours', 8)}h)")
+    print(f"  deps:       {'OK' if deps_ok else 'BROKEN — see problems below'}")
+    print(f"  launchd:    post={'loaded' if loaded else 'NOT loaded'}, "
+          f"gen={'loaded' if gen_loaded else 'NOT loaded'}")
+    print(f"  paused:     {state.get('paused', False)}")
+    print(f"  last run:   {last_str}{last_ago_str}")
+    print(f"  posts (7d): {posts_7d}")
+    print(f"  next:       {next_window_str(cfg, last)}")
+    pstate = _prompt_state()
+    prompt_label = {
+        "missing": "missing (will skip)",
+        "empty": "empty (will skip)",
+        "template": "template — edit before going live (will skip)",
+        "ready": "ready",
+    }[pstate]
+    print(f"  prompt:     {prompt_label}  (used by `drafts generate`, not at fire time)")
+
+    counts = count_drafts_by_status()
+    queue_status = (
+        f"approved={counts['approved']}, pending={counts['pending_approval']}, "
+        f"rejected={counts['rejected']}, posted={counts['posted']}"
+    )
+    print(f"  drafts:     {queue_status}")
+    if counts["approved"] == 0 and active:
+        print("              ← no approved drafts; next fire will skip. "
+              "Run: lipost drafts generate, then review.")
+
+    print(f"  images:     {len(list_pending_images())} pending in {IMAGES_PENDING} "
+          "(run `drafts generate` to consume)")
+    print(f"  config:     baseline_hour={cfg['baseline_hour']}, "
+          f"jitter≤{cfg['jitter_max_secs']//3600}h, "
+          f"min_gap={cfg['min_hours_between_runs']}h, mode={cfg['permission_mode']}, "
+          f"model={cfg['claude_model']}")
+
+    if not deps_ok:
+        print("\n  dependency problems:")
+        for p in deps_problems:
+            print(f"    - {p}")
+
+
+def cmd_bot_pause(args):
+    state = get_bot_state()
+    state["paused"] = True
+    save_bot_state(state)
+    print("paused. resume with: lipost bot resume")
+
+
+def cmd_bot_resume(args):
+    state = get_bot_state()
+    state["paused"] = False
+    save_bot_state(state)
+    print("resumed.")
+
+
+def cmd_bot_start(args):
+    for lbl, dst in ((LABEL_POST, PLIST_POST_DEST), (LABEL_GENERATE, PLIST_GEN_DEST)):
+        if launchctl_loaded(lbl):
+            print(f"{lbl}: already loaded")
+            continue
+        if not dst.exists():
+            print(f"{lbl}: plist symlink missing at {dst} (re-run `lipost bot init`)",
+                  file=sys.stderr)
+            continue
+        r = subprocess.run(["launchctl", "load", "-w", str(dst)], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"{lbl}: failed — {r.stderr}", file=sys.stderr)
+        else:
+            print(f"{lbl}: loaded")
+
+
+def cmd_bot_stop(args):
+    for lbl, dst in ((LABEL_POST, PLIST_POST_DEST), (LABEL_GENERATE, PLIST_GEN_DEST)):
+        if not launchctl_loaded(lbl):
+            print(f"{lbl}: not loaded")
+            continue
+        subprocess.run(["launchctl", "unload", str(dst)], capture_output=True)
+        print(f"{lbl}: unloaded")
+
+
+def cmd_bot_next(args):
+    cfg = get_bot_config()
+    state = get_bot_state()
+    last = parse_iso(state.get("last_run_at"))
+    print(next_window_str(cfg, last))
+
+
+def cmd_bot_logs(args):
+    if not LOG_FILE.exists():
+        print(f"no log file at {LOG_FILE}")
+        return
+    if args.follow:
+        os.execvp("tail", ["tail", "-n", str(args.lines), "-f", str(LOG_FILE)])
+    else:
+        os.execvp("tail", ["tail", "-n", str(args.lines), str(LOG_FILE)])
+
+
+def cmd_bot_uninstall(args):
+    for lbl, dst in ((LABEL_POST, PLIST_POST_DEST), (LABEL_GENERATE, PLIST_GEN_DEST)):
+        if launchctl_loaded(lbl):
+            subprocess.run(["launchctl", "unload", str(dst)], capture_output=True)
+            print(f"unloaded {lbl}")
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+            print(f"removed {dst}")
+    print(f"\nKept: {CONFIG_DIR} (config + history) and {DATA_DIR} (drafts + images). "
+          "Delete by hand if you want a clean slate. The `lipost` PATH symlink at "
+          f"{BIN_LINK} is also kept (the primitive layer still uses it).")
+
+
+# ── cron entry points (launchd) ─────────────────────────────────────────────
+
+def cmd_cron(args):
+    _do_post_run(force=False)
+
+
+def cmd_cron_generate(args):
+    _do_generate_cron()
+
+
+def _do_generate_cron():
+    cfg = get_bot_config()
+
+    if not cfg.get("generate_active", False):
+        log("[generate-cron] inactive (config.generate_active=false) — skipping")
+        return
+
+    ok, problems = check_dependencies()
+    if not ok:
+        for p in problems:
+            log(f"[generate-cron] dependency check failed: {p}")
+        log("[generate-cron] skipping (run `lipost bot status` for details)")
+        return
+
+    pstate = _prompt_state()
+    if pstate != "ready":
+        log(f"[generate-cron] prompt not ready ({pstate}) — skipping")
+        return
+
+    pending = list_pending_images()
+    if not pending:
+        log("[generate-cron] no images in pending — skipping")
+        return
+
+    auth_ok, auth_msg = check_claude_auth(cfg)
+    if not auth_ok:
+        log(f"[generate-cron] claude smoke test failed: {auth_msg} — skipping. "
+            "Run `claude /login` or set ANTHROPIC_API_KEY in the launchd env.")
+        return
+
+    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    log(f"[generate-cron] processing {len(pending)} image(s) using {cfg['claude_model']}")
+
+    saved = skipped = failed = 0
+    for img in pending:
+        try:
+            parsed, info = _invoke_claude_on_image(img, cfg)
+        except KeyboardInterrupt:
+            log("[generate-cron] aborted by signal")
+            return
+
+        if parsed is None:
+            log(f"[generate-cron] {img.name}: ✗ {info}")
+            failed += 1
+            continue
+
+        if parsed.get("skip"):
+            reason = parsed.get("reason", "(no reason given)")
+            park_skipped_image(img, reason)
+            log(f"[generate-cron] {img.name}: SKIP — {reason}")
+            skipped += 1
+            continue
+
+        caption = (parsed.get("caption") or "").strip()
+        alt = (parsed.get("alt") or parsed.get("alt_text") or "").strip()
+        if not caption:
+            log(f"[generate-cron] {img.name}: ✗ JSON had no caption")
+            failed += 1
+            continue
+
+        slug = create_image_draft(img, caption, alt, cfg["claude_model"])
+        log(f"[generate-cron] {img.name}: ✓ draft {slug}")
+        saved += 1
+
+    log(f"[generate-cron] done. saved={saved}, skipped={skipped}, failed={failed}")
+
+
+def _do_post_run(force: bool):
+    cfg = get_bot_config()
+    state = get_bot_state()
+
+    if not force and not cfg.get("active", False):
+        log("inactive (config.active=false) — skipping run. Activate with: lipost bot config active true")
+        return
+
+    if not force and state.get("paused"):
+        log("paused — skipping run")
+        return
+
+    last = parse_iso(state.get("last_run_at"))
+    if not force and last is not None:
+        gap_h = hours_since(last)
+        if gap_h is not None and gap_h < cfg["min_hours_between_runs"]:
+            log(f"only {gap_h:.1f}h since last run (min {cfg['min_hours_between_runs']}h) — skipping")
+            return
+
+    ok, problems = check_dependencies()
+    if not ok:
+        for p in problems:
+            log(f"dependency check failed: {p}")
+        log("skipping run (run `lipost bot status` for details)")
+        return
+
+    draft = _next_approved_draft()
+    if draft is None:
+        counts = count_drafts_by_status()
+        log(f"no approved drafts in queue (pending={counts['pending_approval']}, approved=0) "
+            "— skipping run. Generate with: lipost drafts generate; review with: lipost drafts review")
+        return
+
+    if not force:
+        jitter = random.randint(0, cfg["jitter_max_secs"])
+        log(f"fired; sleeping {jitter}s (~{jitter//3600}h {(jitter%3600)//60}m); "
+            f"will post draft {draft['slug']}")
+        time.sleep(jitter)
+
+    # Mark last_run_at *before* posting — prevents double-fire on crash.
+    state["last_run_at"] = now_iso()
+    save_bot_state(state)
+
+    # Re-read draft after the sleep — user may have changed status during the window.
+    draft_dir = DRAFTS_DIR / draft["slug"]
+    if not (draft_dir / "meta.json").exists():
+        log(f"draft {draft['slug']} disappeared during jitter — skipping")
+        return
+    meta = json.loads((draft_dir / "meta.json").read_text())
+    if meta.get("status") != "approved":
+        log(f"draft {draft['slug']} is no longer approved (status={meta.get('status')}) — skipping")
+        return
+
+    caption = meta.get("caption") or ""
+    alt = meta.get("alt_text") or ""
+    image_filename = meta.get("image_filename")
+    is_text_only = not image_filename
+
+    self_path = shutil.which("lipost", path=CRON_PATH) or str(BIN_LINK) or "lipost"
+    if is_text_only:
+        cmd = [self_path, "post", "-"]
+        stdin_input = caption
+    else:
+        image_path = draft_dir / image_filename
+        cmd = [self_path, "post", "--image", str(image_path)]
+        if alt:
+            cmd.extend(["--alt", alt])
+        cmd.append(caption)
+        stdin_input = None
+
+    log(f"posting draft {draft['slug']} via {self_path} [{'text' if is_text_only else 'image'}]")
+    env = {**os.environ, "PATH": CRON_PATH}
+    try:
+        proc = subprocess.run(
+            cmd, env=env, input=stdin_input,
+            capture_output=True, text=True, timeout=POST_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired as e:
+        log(f"lipost post timed out after 5m; partial output: {(e.stdout or '')[-500:]}")
+        return
+
+    with LOG_FILE.open("a") as f:
+        if proc.stdout:
+            f.write(proc.stdout)
+            if not proc.stdout.endswith("\n"):
+                f.write("\n")
+        if proc.stderr:
+            f.write("[stderr] " + proc.stderr.replace("\n", "\n[stderr] ") + "\n")
+
+    log(f"lipost post exited rc={proc.returncode}")
+
+    if proc.returncode != 0:
+        log(f"post failed; draft {draft['slug']} stays approved for retry on next run")
+        return
+
+    m = URN_RE.search(proc.stdout or "")
+    if not m:
+        log(f"no URN found in output; draft {draft['slug']} stays approved for retry")
+        return
+
+    urn = m.group(1)
+    update_draft(draft["slug"], status="posted", posted_at=now_iso(), urn=urn)
+    log(f"posted {urn} (draft {draft['slug']})")
+
+    entry = {
+        "urn": urn,
+        "posted_at": now_iso(),
+        "exit_code": proc.returncode,
+        "draft_slug": draft["slug"],
+        "source_image": meta.get("source_filename"),
+    }
+    POSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with POSTS_FILE.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+# ── inventory & utility commands ────────────────────────────────────────────
+
+def cmd_posts(args):
+    if not POSTS_FILE.exists():
+        # Backward-compat: try the legacy posts.jsonl too.
+        if OLD_BOT_POSTS_FILE.exists():
+            posts_src = OLD_BOT_POSTS_FILE
+        else:
+            print("no posts yet.")
+            return
+    else:
+        posts_src = POSTS_FILE
+
+    entries = []
+    for line in posts_src.read_text().splitlines():
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    entries.reverse()
+    if args.limit:
+        entries = entries[:args.limit]
+
+    if args.open and entries:
+        urn = entries[0]["urn"]
+        url = f"https://www.linkedin.com/feed/update/{urn}/"
+        subprocess.run(["open", url])
+        print(f"opened {url}")
+        return
+
+    if not entries:
+        print("no posts yet.")
+        return
+    for e in entries:
+        when = parse_iso(e.get("posted_at"))
+        when_str = fmt_local(when) if when else "?"
+        print(f"  {when_str}  {e['urn']}")
+    print(f"\n({len(entries)} shown; full history at {posts_src})")
+
+
+def cmd_images(args):
+    if args.open:
+        target = IMAGES_SKIPPED if args.skipped else IMAGES_PENDING
+        target.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["open", str(target)])
+        print(f"opened {target} in Finder")
+        return
+
+    pending = list_pending_images()
+    skipped = (sorted(p for p in IMAGES_SKIPPED.iterdir()
+                      if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+               if IMAGES_SKIPPED.exists() else [])
+
+    print(f"pending ({IMAGES_PENDING}): {len(pending)} file(s)")
+    for p in pending:
+        size = p.stat().st_size
+        print(f"  {p.name} ({size:,} bytes)")
+    if skipped:
+        print(f"\nskipped ({IMAGES_SKIPPED}): {len(skipped)} file(s) Claude said SKIP on")
+        for p in skipped[-10:]:
+            print(f"  {p.name}")
+        if len(skipped) > 10:
+            print(f"  … {len(skipped) - 10} older")
+    print(f"\nDrop new images into {IMAGES_PENDING}/ — supported: {', '.join(sorted(IMAGE_EXTS))}")
+    print("Open in Finder: lipost images --open  (add --skipped to open the skipped dir)")
+
+
+def cmd_prompt(args):
+    PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not PROMPT_FILE.exists() and EXAMPLE_PROMPT_FILE.exists():
+        # First-time use: seed from example so the user has something to edit.
+        PROMPT_FILE.write_text(EXAMPLE_PROMPT_FILE.read_text())
+        print(f"Seeded {PROMPT_FILE} from {EXAMPLE_PROMPT_FILE.name} (TEMPLATE marker on line 1; "
+              "remove it before going live).")
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.call([editor, str(PROMPT_FILE)])
+
+
+def cmd_style(args):
+    if args.show:
+        layer = get_style_layer()
+        if not layer:
+            print("(no style layer — neither share/style.md nor user_style.md is present)")
+            return
+        print(layer.lstrip())
+        return
+
+    if args.baked:
+        if not BAKED_STYLE_FILE.exists():
+            print(f"(no {BAKED_STYLE_FILE.name} — the baked-in style layer is missing from the repo)")
+            return
+        print(BAKED_STYLE_FILE.read_text().rstrip())
+        return
+
+    USER_STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not USER_STYLE_FILE.exists():
+        USER_STYLE_FILE.write_text(
+            "# Your additional formatting/punctuation rules\n\n"
+            "# These append to the baked-in style layer (share/style.md).\n"
+            "# Keep this focused on FORMATTING and PUNCTUATION, not voice or content —\n"
+            "# voice/content rules belong in prompt.md.\n"
+        )
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.call([editor, str(USER_STYLE_FILE)])
+
+
+CHEATSHEET = """
+# ─── primitives (no daemon needed) ─────────────────────────────
+lipost init                      # OAuth + first-time setup
+lipost auth                      # re-auth (tokens last ~60 days)
+lipost whoami
+lipost post "hello"              # post text
+lipost post -i pic.jpg --alt "X" "caption"   # post image
+lipost post --queue "draft"      # enqueue as approved (no daemon needed to write)
+lipost edit <urn> "new text"
+lipost delete <urn>
+
+# ─── article skill (Claude reads URL → reviewed draft) ─────────
+lipost article <url>             # interactive: approve/edit/regenerate/queue/cancel
+lipost article <url> --queue     # at [q]ueue: enqueue as approved
+lipost article <url> --queue-pending   # at [q]: enqueue for review
+
+# ─── pulse check ───────────────────────────────────────────────
+lipost bot status                # one-screen overview
+
+# ─── content workflow (image-driven) ───────────────────────────
+lipost images                    # what's staged
+lipost images --open             # open pending dir in Finder
+lipost drafts generate           # drain pending → drafts (Claude per image)
+lipost drafts review             # walk pending drafts: a/r/e/g/s/q
+lipost drafts                    # full queue grouped by status
+lipost drafts --status approved  # what's queued to post
+
+# ─── posting ───────────────────────────────────────────────────
+lipost drafts run --no-fire      # show next post WITHOUT publishing
+lipost drafts run                # post the next approved draft NOW
+lipost posts                     # what you've published (URN history)
+lipost posts --open              # open most recent post on LinkedIn
+
+# ─── customization ─────────────────────────────────────────────
+lipost prompt                    # edit prompt.md (voice, content)
+lipost style                     # edit user_style.md (your formatting tweaks)
+lipost style --show              # preview what Claude actually sees
+
+# ─── scheduling (the bot) ──────────────────────────────────────
+lipost bot init                  # set up launchd (macOS only)
+lipost bot next                  # next scheduled fire window
+lipost bot config active true|false           # arm/disarm post cron
+lipost bot config generate_active true|false  # arm/disarm generate cron
+lipost bot pause / resume        # transient pause without unloading launchd
+lipost bot start / stop          # off / on the schedule
+
+# ─── observability ─────────────────────────────────────────────
+lipost bot logs -f               # tail what crons are doing right now
+lipost bot logs -n 100           # last 100 lines
+
+# Daily flow (image bot):
+#   1. lipost images --open  → drag images in
+#   2. (Wait for cron, or `lipost drafts generate` for instant)
+#   3. lipost drafts review  → approve/reject/edit/regenerate
+#   4. lipost bot status     → confirm queue depth
+#
+# Full surface: lipost --help
+"""
+
+
+def cmd_cheatsheet(args):
+    print(CHEATSHEET.strip())
+
+
+# ── argparse ────────────────────────────────────────────────────────────────
+
+def make_parser():
+    p = argparse.ArgumentParser(
+        prog="lipost",
+        description="LinkedIn posting suite: primitive API, article-to-post skill, "
+                    "and an autonomous bot.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Run `lipost cheatsheet` for a curated short list of common commands.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=False, metavar="<command>")
+
+    # ─── primitives ───
+    sp = sub.add_parser("init", help="OAuth + first-time setup (also migrates legacy paths)")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("auth", help="run the LinkedIn OAuth browser flow")
+    sp.set_defaults(func=cmd_auth)
+
+    sp = sub.add_parser("whoami", help="show authenticated member URN")
+    sp.set_defaults(func=cmd_whoami)
+
+    sp = sub.add_parser(
+        "post",
+        help='post text/image to LinkedIn (or use --queue to enqueue)',
+        description='Post text or image to your LinkedIn feed.\n\n'
+                    'Use `-` as the text body to read from stdin.\n'
+                    '--queue and --queue-pending enqueue a text-only draft instead of posting.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sp.add_argument("text", nargs="*", help='post body (use "-" for stdin)')
+    sp.add_argument("--image", "-i", help="image file to attach")
+    sp.add_argument("--alt", help="image alt text")
+    sp.add_argument("--dry-run", "-n", action="store_true",
+                    help="print the request without sending it")
+    sp.add_argument("--queue", action="store_true",
+                    help="enqueue as an approved draft (no API call)")
+    sp.add_argument("--queue-pending", action="store_true",
+                    help="enqueue as pending_approval (forces review before posting)")
+    sp.set_defaults(func=cmd_post)
+
+    sp = sub.add_parser("edit", help="edit a post's commentary (text only)")
+    sp.add_argument("urn", help="post URN (e.g. urn:li:share:1234567890)")
+    sp.add_argument("text", nargs="+", help='new commentary text (use "-" for stdin)')
+    sp.set_defaults(func=cmd_edit)
+
+    sp = sub.add_parser("delete", help="delete a post by URN")
+    sp.add_argument("urn", help="post URN")
+    sp.set_defaults(func=cmd_delete)
+
+    # ─── article ───
+    sp = sub.add_parser(
+        "article",
+        help="turn an article URL into a LinkedIn post (Claude generates → review → post/queue)",
+        description='Fetch an article, draft a post about it via Claude (Opus 4.7), '
+                    'show for review, then publish or enqueue.',
+    )
+    sp.add_argument("url", nargs="?", help="article URL (prompted if omitted)")
+    sp.add_argument("--dry-run", "-n", action="store_true",
+                    help="don't actually publish (also disables real queuing)")
+    sp.add_argument("--queue", action="store_true",
+                    help="when [q] is selected, enqueue as approved (default)")
+    sp.add_argument("--queue-pending", action="store_true",
+                    help="when [q] is selected, enqueue as pending_approval")
+    sp.set_defaults(func=cmd_article)
+
+    # ─── drafts ───
+    sp_drafts = sub.add_parser(
+        "drafts",
+        help="list / add / review / generate / run drafts in the queue",
+        description='Manage the draft queue. With no sub-subcommand, lists all drafts.',
+    )
+    sp_drafts.add_argument("--status", default=None, help=f"filter list to one of: {', '.join(sorted(VALID_DRAFT_STATUSES))}")
+    sp_drafts.add_argument("--limit", type=int, default=10, help="max items per status (default 10)")
+    sp_drafts.set_defaults(func=cmd_drafts_list)  # default action when no sub-sub given
+
+    drafts_sub = sp_drafts.add_subparsers(dest="drafts_cmd", required=False, metavar="<action>")
+
+    sp = drafts_sub.add_parser("list", help="list drafts grouped by status (default)")
+    sp.add_argument("--status", default=None)
+    sp.add_argument("--limit", type=int, default=10)
+    sp.set_defaults(func=cmd_drafts_list)
+
+    sp = drafts_sub.add_parser("add", help="enqueue a text-only draft from --text or stdin")
+    sp.add_argument("--text", default=None, help="caption text; pass '-' or omit to read from stdin")
+    sp.add_argument("--source", default=None, help="optional source URL recorded in meta.json")
+    sp.add_argument("--status", default="approved", choices=["approved", "pending_approval"],
+                    help="initial draft status (default: approved)")
+    sp.add_argument("--model", default=None, help="optional model identifier recorded in meta.json")
+    sp.set_defaults(func=cmd_drafts_add)
+
+    sp = drafts_sub.add_parser("review", help="walk pending drafts (a/r/e/g/s/q)")
+    sp.set_defaults(func=cmd_review)
+
+    sp = drafts_sub.add_parser("generate",
+                               help=f"drain {IMAGES_PENDING} — Claude writes a caption per image")
+    sp.set_defaults(func=cmd_generate)
+
+    sp = drafts_sub.add_parser("run",
+                               help="post the next approved draft now (no jitter, ignores guards)")
+    sp.add_argument("--no-fire", action="store_true",
+                    help="show the resolved plan without calling lipost")
+    sp.set_defaults(func=cmd_drafts_run)
+
+    # ─── bot ───
+    sp_bot = sub.add_parser(
+        "bot",
+        help="install / configure / inspect the launchd-driven autoposter (macOS only)",
+    )
+    bot_sub = sp_bot.add_subparsers(dest="bot_cmd", required=True, metavar="<action>")
+
+    sp = bot_sub.add_parser("init", help="install launchd jobs, write config, migrate legacy state")
+    sp.add_argument("--force", action="store_true", help="skip the dependency preflight")
+    sp.set_defaults(func=cmd_bot_init)
+
+    sp = bot_sub.add_parser("status",
+                            help="one-screen overview: active, deps, launchd, paused, queue, …")
+    sp.set_defaults(func=cmd_bot_status)
+
+    sp = bot_sub.add_parser(
+        "config",
+        help="show or update settings (active, baseline_hour, jitter_max_secs, …)",
+    )
+    sp.add_argument("key", nargs="?")
+    sp.add_argument("value", nargs="?")
+    sp.set_defaults(func=cmd_bot_config)
+
+    bot_sub.add_parser("pause", help="skip runs without unloading launchd").set_defaults(func=cmd_bot_pause)
+    bot_sub.add_parser("resume", help="undo pause").set_defaults(func=cmd_bot_resume)
+    bot_sub.add_parser("start", help="load both launchd jobs (post + generate)").set_defaults(func=cmd_bot_start)
+    bot_sub.add_parser("stop", help="unload both launchd jobs").set_defaults(func=cmd_bot_stop)
+    bot_sub.add_parser("next", help="print the next scheduled window").set_defaults(func=cmd_bot_next)
+
+    sp = bot_sub.add_parser("logs", help=f"tail {LOG_FILE}")
+    sp.add_argument("-f", "--follow", action="store_true")
+    sp.add_argument("-n", "--lines", type=int, default=50)
+    sp.set_defaults(func=cmd_bot_logs)
+
+    bot_sub.add_parser("uninstall",
+                       help="remove launchd jobs (keeps config + drafts + history + lipost symlink)"
+                       ).set_defaults(func=cmd_bot_uninstall)
+
+    # ─── inventory & utility ───
+    sp = sub.add_parser("posts", help="list past posts (URN history)")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--open", action="store_true", help="open the most recent post in browser")
+    sp.set_defaults(func=cmd_posts)
+
+    sp = sub.add_parser("images", help=f"list pending and skipped images under {IMAGES_DIR}")
+    sp.add_argument("--open", action="store_true",
+                    help="open pending dir in Finder (combine with --skipped to open skipped dir)")
+    sp.add_argument("--skipped", action="store_true",
+                    help="with --open, open images/skipped/ instead")
+    sp.set_defaults(func=cmd_images)
+
+    sp = sub.add_parser("prompt", help=f"edit {PROMPT_FILE} in $EDITOR")
+    sp.set_defaults(func=cmd_prompt)
+
+    sp = sub.add_parser("style",
+                        help="view or edit the formatting layer (share/style.md baked + user_style.md)")
+    sp.add_argument("--show", action="store_true",
+                    help="print the combined style layer that gets injected at generate time")
+    sp.add_argument("--baked", action="store_true",
+                    help="print only the baked-in share/style.md (read-only)")
+    sp.set_defaults(func=cmd_style)
+
+    sub.add_parser("cheatsheet",
+                   help="print a curated short list of the most-used commands"
+                   ).set_defaults(func=cmd_cheatsheet)
+
+    return p
+
+
+def main():
+    # Internal cron entry points are dispatched before argparse so they don't
+    # appear in `--help` output (Python 3.14's argparse leaks SUPPRESS for
+    # subparsers). launchd plists call these directly.
+    if len(sys.argv) >= 2 and sys.argv[1] in ("_cron", "_cron_generate"):
+        if sys.argv[1] == "_cron":
+            cmd_cron(None)
+        else:
+            cmd_cron_generate(None)
+        return
+
+    parser = make_parser()
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
+        parser.print_help()
+        sys.exit(1)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

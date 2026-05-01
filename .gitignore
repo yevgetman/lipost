@@ -1,6 +1,7 @@
 # Local config / secrets (should never live in the repo, but belt-and-suspenders)
 config.json
 token.json
+auth.json
 *.secret
 .env
 .env.*
