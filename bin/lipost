@@ -20,6 +20,7 @@ Single file, Python 3 stdlib only — no `pip install`. macOS for the bot
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import random
@@ -69,6 +70,7 @@ DRAFTS_DIR = DATA_DIR / "drafts"
 IMAGES_DIR = DATA_DIR / "images"
 IMAGES_PENDING = IMAGES_DIR / "pending"
 IMAGES_SKIPPED = IMAGES_DIR / "skipped"
+ARTICLE_IMAGES_DIR = IMAGES_DIR / "generated"
 
 # Symlink installed onto PATH for tab-complete.
 BIN_LINK = HOME / ".local" / "bin" / "lipost"
@@ -123,6 +125,11 @@ CLAUDE_DEFAULT_MODEL = "claude-opus-4-7"
 ARTICLE_TIMEOUT_SECS = 10 * 60
 GENERATE_TIMEOUT_SECS = 10 * 60
 POST_TIMEOUT_SECS = 5 * 60
+OPENAI_IMAGE_TIMEOUT_SECS = 5 * 60
+OPENAI_IMAGE_MODEL = "gpt-image-2"
+OPENAI_IMAGE_SIZE = "1024x1024"
+OPENAI_IMAGE_QUALITY = "medium"
+OPENAI_IMAGE_FORMAT = "jpeg"
 
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 URN_RE = re.compile(r"posted:\s+(urn:li:\S+)")
@@ -183,6 +190,28 @@ def http_json(method, url, headers=None, data=None, form=False):
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode()
+            return resp.status, dict(resp.headers), (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {"raw": raw}
+        return e.code, dict(e.headers or {}), parsed
+    except urllib.error.URLError as e:
+        return 0, {}, {"error": {"message": str(e)}}
+
+
+def http_json_timeout(method, url, headers=None, data=None, timeout=None):
+    headers = dict(headers or {})
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode()
+        headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode()
             return resp.status, dict(resp.headers), (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as e:
@@ -712,11 +741,12 @@ Two valid shapes depending on whether you included a heading:
 - With heading: heading line → body paragraphs → article URL.
 - Without heading: body paragraphs → article URL.
 
-Output a single JSON object on stdout — and ONLY that JSON object. No
-preamble, no markdown fence, no explanation. One of these two shapes:
+{image_requirements}
 
-{{"caption": "<heading>\\n\\n<body paragraphs>\\n\\n{url}"}}
-{{"caption": "<body paragraphs>\\n\\n{url}"}}
+Output a single JSON object on stdout — and ONLY that JSON object. No
+preamble, no markdown fence, no explanation. Use one of these JSON shapes:
+
+{output_shapes}
 
 If the article is off-domain, thin, or you'd be repeating yourself:
 
@@ -724,9 +754,9 @@ If the article is off-domain, thin, or you'd be repeating yourself:
 
 The persona, audience, voice rules, banned phrases, and length rules from
 the persona block below all apply. The image-specific bits in that block
-(the {{{{IMAGE_PATH}}}} placeholder, the Read-the-image step, the "alt"
-field in the output schema) do NOT apply here — this is a text-only post
-about an article you fetched from the web.
+(the {{{{IMAGE_PATH}}}} placeholder and the Read-the-image step) do NOT
+apply here. When image generation is requested, use the article image
+instructions above instead.
 
 --- PERSONA & VOICE ---
 
@@ -736,6 +766,34 @@ about an article you fetched from the web.
 rules above. These describe HOW the text should look, not WHAT to say.) ---
 
 {style}
+"""
+
+ARTICLE_TEXT_OUTPUT_SHAPES = """\
+{{"caption": "<heading>\\n\\n<body paragraphs>\\n\\n{url}"}}
+{{"caption": "<body paragraphs>\\n\\n{url}"}}
+"""
+
+ARTICLE_IMAGE_REQUIREMENTS = """\
+Because the human requested an image for this article, also produce:
+
+- "image_prompt": a prompt for an image generation model. Base it on the
+  article's actual substance, not the title alone. The image should be a
+  stylish, clean infographic-style asset: intriguing, visually engaging,
+  striking, informative, and not too busy. Prefer a clear visual hierarchy,
+  restrained color palette, strong composition, and a small number of concrete
+  visual elements that communicate the article's central mechanism or
+  tradeoff. Use editorial illustration, diagram-like metaphor, or product /
+  workflow scene when appropriate; avoid generic stock imagery. Do not ask for
+  logos, screenshots, real identifiable people, or legible headline text. If
+  text would help, describe visual structure without relying on readable words
+  in the image.
+- "alt": one factual one-line alt text for the generated image, under 250
+  characters.
+"""
+
+ARTICLE_IMAGE_OUTPUT_SHAPES = """\
+{{"caption": "<heading>\\n\\n<body paragraphs>\\n\\n{url}", "image_prompt": "<image prompt>", "alt": "<alt text>"}}
+{{"caption": "<body paragraphs>\\n\\n{url}", "image_prompt": "<image prompt>", "alt": "<alt text>"}}
 """
 
 
@@ -812,9 +870,15 @@ def _resolve_style_for_article() -> str:
     return target.read_text().strip()
 
 
-def build_article_prompt(url: str) -> str:
+def build_article_prompt(url: str, include_image: bool = False) -> str:
     return ARTICLE_WRAPPER.format(
         url=url,
+        image_requirements=ARTICLE_IMAGE_REQUIREMENTS if include_image else "",
+        output_shapes=(
+            ARTICLE_IMAGE_OUTPUT_SHAPES.format(url=url)
+            if include_image
+            else ARTICLE_TEXT_OUTPUT_SHAPES.format(url=url)
+        ),
         persona=_resolve_prompt_for_article(),
         style=_resolve_style_for_article(),
     )
@@ -910,8 +974,88 @@ def show_draft(caption: str) -> None:
     print()
 
 
-def _generate_article_once(url: str, extra_steer: str = "") -> dict:
-    prompt = build_article_prompt(url)
+def show_article_image(image_path: Path | None, alt_text: str | None) -> None:
+    if not image_path:
+        return
+    print(f"image: {image_path}")
+    if alt_text:
+        print(f"alt:   {alt_text}")
+    print()
+
+
+def _openai_image_config(args) -> tuple[str, str, str, str]:
+    model = getattr(args, "image_model", None) or os.environ.get("LIPOST_OPENAI_IMAGE_MODEL") or OPENAI_IMAGE_MODEL
+    size = getattr(args, "image_size", None) or os.environ.get("LIPOST_OPENAI_IMAGE_SIZE") or OPENAI_IMAGE_SIZE
+    quality = getattr(args, "image_quality", None) or os.environ.get("LIPOST_OPENAI_IMAGE_QUALITY") or OPENAI_IMAGE_QUALITY
+    output_format = (
+        getattr(args, "image_format", None)
+        or os.environ.get("LIPOST_OPENAI_IMAGE_FORMAT")
+        or OPENAI_IMAGE_FORMAT
+    )
+    return model, size, quality, output_format
+
+
+def _generate_openai_article_image(prompt: str, args) -> Path:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        die("OPENAI_API_KEY is required for `lipost article --with-image`")
+    if not prompt.strip():
+        die("empty OpenAI image prompt")
+
+    model, size, quality, output_format = _openai_image_config(args)
+    if size not in {"1024x1024", "1024x1536", "1536x1024"}:
+        die("image size must be 1024x1024, 1024x1536, or 1536x1024")
+    if quality not in {"low", "medium", "high"}:
+        die("image quality must be low, medium, or high")
+    if output_format not in {"jpeg", "png"}:
+        die("image format must be jpeg or png for LinkedIn posting")
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "size": size,
+        "quality": quality,
+        "output_format": output_format,
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if os.environ.get("OPENAI_ORG_ID"):
+        headers["OpenAI-Organization"] = os.environ["OPENAI_ORG_ID"]
+    if os.environ.get("OPENAI_PROJECT_ID"):
+        headers["OpenAI-Project"] = os.environ["OPENAI_PROJECT_ID"]
+
+    print(f"generating image with OpenAI ({model}, {size}, {quality})...", flush=True)
+    status, _, body = http_json_timeout(
+        "POST",
+        "https://api.openai.com/v1/images/generations",
+        headers=headers,
+        data=payload,
+        timeout=OPENAI_IMAGE_TIMEOUT_SECS,
+    )
+    if status not in (200, 201):
+        err = body.get("error", body)
+        if isinstance(err, dict) and err.get("message"):
+            err = err["message"]
+        die(f"OpenAI image generation failed (HTTP {status}): {err}")
+
+    data = (body.get("data") or [{}])[0]
+    b64 = data.get("b64_json")
+    if not b64:
+        die(f"OpenAI image response did not include b64_json: {body}")
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        die(f"OpenAI image response was not valid base64: {e}")
+
+    ext = ".jpg" if output_format == "jpeg" else f".{output_format}"
+    ARTICLE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    out = ARTICLE_IMAGES_DIR / f"article_{make_slug()}{ext}"
+    out.write_bytes(raw)
+    print(f"saved image: {out}")
+    return out
+
+
+def _generate_article_once(url: str, extra_steer: str = "", include_image: bool = False) -> dict:
+    prompt = build_article_prompt(url, include_image=include_image)
     if extra_steer:
         prompt += "\n\n--- ADDITIONAL STEERING (from previous round) ---\n\n" + extra_steer
     print("calling claude (Opus 4.7) — this usually takes 30–90s...", flush=True)
@@ -922,13 +1066,21 @@ def _generate_article_once(url: str, extra_steer: str = "") -> dict:
         die(f"claude skipped: {parsed.get('reason', '(no reason given)')}", code=2)
     if "caption" not in parsed:
         die(f"claude returned JSON without a caption: {parsed!r}")
+    if include_image:
+        if "image_prompt" not in parsed:
+            die(f"claude returned JSON without an image_prompt: {parsed!r}")
+        if "alt" not in parsed and "alt_text" not in parsed:
+            die(f"claude returned JSON without alt text: {parsed!r}")
     return parsed
 
 
-def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: str) -> int:
+def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: str,
+                         image_path: Path | None = None, alt_text: str | None = None,
+                         article_args=None) -> int:
     caption = parsed["caption"]
     while True:
         show_draft(caption)
+        show_article_image(image_path, alt_text)
         choice = prompt_choice(
             {"a": "pprove", "e": "dit", "r": "egenerate", "q": "ueue", "c": "ancel"},
             default="a",
@@ -936,7 +1088,12 @@ def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: st
         if choice == "a":
             print("posting to LinkedIn...")
             try:
-                _post_to_linkedin(caption, image_path=None, alt_text=None, dry_run=dry_run)
+                _post_to_linkedin(
+                    caption,
+                    image_path=str(image_path) if image_path else None,
+                    alt_text=alt_text,
+                    dry_run=dry_run,
+                )
                 return 0
             except SystemExit as e:
                 return e.code if isinstance(e.code, int) else 1
@@ -944,8 +1101,18 @@ def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: st
             if dry_run:
                 print(f"[dry-run] would enqueue draft (status={queue_status})")
                 return 0
-            slug = create_text_draft(caption, source_url=url, model="lipost article",
-                                     status=queue_status)
+            if image_path:
+                slug = create_image_draft(
+                    image_path,
+                    caption,
+                    alt_text or "",
+                    parsed.get("image_model") or "lipost article --with-image",
+                    source_url=url,
+                    status=queue_status,
+                )
+            else:
+                slug = create_text_draft(caption, source_url=url, model="lipost article",
+                                         status=queue_status)
             print(f"queued as draft {slug} (status={queue_status})")
             if queue_status == "pending_approval":
                 print("review with: lipost drafts review")
@@ -972,8 +1139,12 @@ def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: st
                     + caption
                     + "\n\nThe human reviewer asked for this change: " + steer
                 )
-            parsed = _generate_article_once(url, extra_steer=extra)
+            parsed = _generate_article_once(url, extra_steer=extra, include_image=bool(image_path))
             caption = parsed["caption"]
+            if image_path:
+                alt_text = (parsed.get("alt") or parsed.get("alt_text") or "").strip()
+                image_path = _generate_openai_article_image(parsed["image_prompt"], article_args)
+                parsed["image_model"] = _openai_image_config(article_args)[0]
             continue
         if choice == "c":
             print("cancelled.")
@@ -987,8 +1158,29 @@ def cmd_article(args):
     if not URL_RE.match(url):
         die(f"not a URL: {url}")
     queue_status = "pending_approval" if args.queue_pending else "approved"
-    parsed = _generate_article_once(url)
-    rc = _article_review_loop(url, parsed, dry_run=args.dry_run, queue_status=queue_status)
+    parsed = _generate_article_once(url, include_image=args.with_image)
+    image_path = None
+    alt_text = None
+    if args.with_image:
+        alt_text = (parsed.get("alt") or parsed.get("alt_text") or "").strip()
+        parsed["image_model"] = _openai_image_config(args)[0]
+        if args.dry_run:
+            print("[dry-run] skipping OpenAI image generation.")
+            print("--- image prompt ---")
+            print(parsed["image_prompt"])
+            print("--- alt ---")
+            print(alt_text)
+        else:
+            image_path = _generate_openai_article_image(parsed["image_prompt"], args)
+    rc = _article_review_loop(
+        url,
+        parsed,
+        dry_run=args.dry_run,
+        queue_status=queue_status,
+        image_path=image_path,
+        alt_text=alt_text,
+        article_args=args,
+    )
     sys.exit(rc)
 
 
@@ -1030,7 +1222,10 @@ def count_drafts_by_status():
     return counts
 
 
-def create_image_draft(image_src: Path, caption: str, alt_text: str, model: str) -> str:
+def create_image_draft(image_src: Path, caption: str, alt_text: str, model: str,
+                       *, source_url=None, status="pending_approval") -> str:
+    if status not in VALID_DRAFT_STATUSES:
+        raise ValueError(f"invalid status: {status}")
     slug = make_slug()
     draft_dir = DRAFTS_DIR / slug
     draft_dir.mkdir(parents=True, exist_ok=False)
@@ -1041,14 +1236,14 @@ def create_image_draft(image_src: Path, caption: str, alt_text: str, model: str)
 
     meta = {
         "slug": slug,
-        "status": "pending_approval",
+        "status": status,
         "caption": caption.strip(),
         "alt_text": (alt_text or "").strip(),
         "image_filename": image_filename,
         "source_filename": image_src.name,
-        "source_url": None,
+        "source_url": source_url,
         "created_at": now_iso(),
-        "approved_at": None,
+        "approved_at": now_iso() if status == "approved" else None,
         "rejected_at": None,
         "posted_at": None,
         "urn": None,
@@ -2401,6 +2596,7 @@ lipost delete <urn>
 
 # ─── article skill (Claude reads URL → reviewed draft) ─────────
 lipost article <url>             # interactive: approve/edit/regenerate/queue/cancel
+lipost article --with-image <url> # also generate an OpenAI image
 lipost article <url> --queue     # at [q]ueue: enqueue as approved
 lipost article <url> --queue-pending   # at [q]: enqueue for review
 
@@ -2505,9 +2701,10 @@ def make_parser():
     # ─── article ───
     sp = sub.add_parser(
         "article",
-        help="turn an article URL into a LinkedIn post (Claude generates → review → post/queue)",
+        help="turn an article URL into a LinkedIn post (optionally with an OpenAI image)",
         description='Fetch an article, draft a post about it via Claude (Opus 4.7), '
-                    'show for review, then publish or enqueue.',
+                    'optionally generate an image with OpenAI, show for review, '
+                    'then publish or enqueue.',
     )
     sp.add_argument("url", nargs="?", help="article URL (prompted if omitted)")
     sp.add_argument("--dry-run", "-n", action="store_true",
@@ -2516,6 +2713,19 @@ def make_parser():
                     help="when [q] is selected, enqueue as approved (default)")
     sp.add_argument("--queue-pending", action="store_true",
                     help="when [q] is selected, enqueue as pending_approval")
+    sp.add_argument("--with-image", action="store_true",
+                    help="also generate an article-based image using OpenAI")
+    sp.add_argument("--image-model", default=None,
+                    help=f"OpenAI image model for --with-image (default: {OPENAI_IMAGE_MODEL})")
+    sp.add_argument("--image-size", default=None,
+                    choices=["1024x1024", "1024x1536", "1536x1024"],
+                    help=f"OpenAI image size for --with-image (default: {OPENAI_IMAGE_SIZE})")
+    sp.add_argument("--image-quality", default=None,
+                    choices=["low", "medium", "high"],
+                    help=f"OpenAI image quality for --with-image (default: {OPENAI_IMAGE_QUALITY})")
+    sp.add_argument("--image-format", default=None,
+                    choices=["jpeg", "png"],
+                    help=f"OpenAI image format for --with-image (default: {OPENAI_IMAGE_FORMAT})")
     sp.set_defaults(func=cmd_article)
 
     # ─── drafts ───
