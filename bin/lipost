@@ -1054,6 +1054,18 @@ def _generate_openai_article_image(prompt: str, args) -> Path:
     return out
 
 
+def _resolve_user_article_image(path_arg: str) -> Path:
+    image_path = Path(path_arg).expanduser()
+    if not image_path.exists():
+        die(f"article image not found: {image_path}")
+    if not image_path.is_file():
+        die(f"article image is not a file: {image_path}")
+    if image_path.suffix.lower() not in IMAGE_EXTS:
+        die(f"unsupported article image type: {image_path.suffix or '(none)'}; "
+            f"supported: {', '.join(sorted(IMAGE_EXTS))}")
+    return image_path
+
+
 def _generate_article_once(url: str, extra_steer: str = "", include_image: bool = False) -> dict:
     prompt = build_article_prompt(url, include_image=include_image)
     if extra_steer:
@@ -1076,6 +1088,8 @@ def _generate_article_once(url: str, extra_steer: str = "", include_image: bool 
 
 def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: str,
                          image_path: Path | None = None, alt_text: str | None = None,
+                         image_mode: str | None = None,
+                         consume_image_source=True,
                          article_args=None) -> int:
     caption = parsed["caption"]
     while True:
@@ -1106,9 +1120,10 @@ def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: st
                     image_path,
                     caption,
                     alt_text or "",
-                    parsed.get("image_model") or "lipost article --with-image",
+                    parsed.get("image_model") or f"lipost article --{image_mode or 'image'}",
                     source_url=url,
                     status=queue_status,
+                    consume_source=consume_image_source,
                 )
             else:
                 slug = create_text_draft(caption, source_url=url, model="lipost article",
@@ -1139,9 +1154,13 @@ def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: st
                     + caption
                     + "\n\nThe human reviewer asked for this change: " + steer
                 )
-            parsed = _generate_article_once(url, extra_steer=extra, include_image=bool(image_path))
+            parsed = _generate_article_once(
+                url,
+                extra_steer=extra,
+                include_image=image_mode == "with-image",
+            )
             caption = parsed["caption"]
-            if image_path:
+            if image_mode == "with-image":
                 alt_text = (parsed.get("alt") or parsed.get("alt_text") or "").strip()
                 image_path = _generate_openai_article_image(parsed["image_prompt"], article_args)
                 parsed["image_model"] = _openai_image_config(article_args)[0]
@@ -1154,14 +1173,24 @@ def _article_review_loop(url: str, parsed: dict, dry_run: bool, queue_status: st
 def cmd_article(args):
     if args.queue and args.queue_pending:
         die("--queue and --queue-pending are mutually exclusive")
+    if args.with_image and args.image:
+        die("--with-image and --image are mutually exclusive")
     url = args.url or prompt_url()
     if not URL_RE.match(url):
         die(f"not a URL: {url}")
-    queue_status = "pending_approval" if args.queue_pending else "approved"
-    parsed = _generate_article_once(url, include_image=args.with_image)
     image_path = None
     alt_text = None
+    image_mode = None
+    consume_image_source = True
+    if args.image:
+        image_mode = "image"
+        image_path = _resolve_user_article_image(args.image)
+        alt_text = (args.alt or "").strip()
+        consume_image_source = False
+    queue_status = "pending_approval" if args.queue_pending else "approved"
+    parsed = _generate_article_once(url, include_image=args.with_image)
     if args.with_image:
+        image_mode = "with-image"
         alt_text = (parsed.get("alt") or parsed.get("alt_text") or "").strip()
         parsed["image_model"] = _openai_image_config(args)[0]
         if args.dry_run:
@@ -1172,6 +1201,9 @@ def cmd_article(args):
             print(alt_text)
         else:
             image_path = _generate_openai_article_image(parsed["image_prompt"], args)
+        consume_image_source = True
+    if args.image:
+        parsed["image_model"] = "lipost article --image"
     rc = _article_review_loop(
         url,
         parsed,
@@ -1179,6 +1211,8 @@ def cmd_article(args):
         queue_status=queue_status,
         image_path=image_path,
         alt_text=alt_text,
+        image_mode=image_mode,
+        consume_image_source=consume_image_source,
         article_args=args,
     )
     sys.exit(rc)
@@ -1223,7 +1257,8 @@ def count_drafts_by_status():
 
 
 def create_image_draft(image_src: Path, caption: str, alt_text: str, model: str,
-                       *, source_url=None, status="pending_approval") -> str:
+                       *, source_url=None, status="pending_approval",
+                       consume_source=True) -> str:
     if status not in VALID_DRAFT_STATUSES:
         raise ValueError(f"invalid status: {status}")
     slug = make_slug()
@@ -1232,7 +1267,10 @@ def create_image_draft(image_src: Path, caption: str, alt_text: str, model: str,
 
     image_filename = f"image{image_src.suffix.lower()}"
     image_dst = draft_dir / image_filename
-    image_src.rename(image_dst)
+    if consume_source:
+        image_src.rename(image_dst)
+    else:
+        shutil.copy2(image_src, image_dst)
 
     meta = {
         "slug": slug,
@@ -2597,6 +2635,7 @@ lipost delete <urn>
 # ─── article skill (Claude reads URL → reviewed draft) ─────────
 lipost article <url>             # interactive: approve/edit/regenerate/queue/cancel
 lipost article --with-image <url> # also generate an OpenAI image
+lipost article --image pic.jpg <url> # use your own image with the article draft
 lipost article <url> --queue     # at [q]ueue: enqueue as approved
 lipost article <url> --queue-pending   # at [q]: enqueue for review
 
@@ -2715,6 +2754,10 @@ def make_parser():
                     help="when [q] is selected, enqueue as pending_approval")
     sp.add_argument("--with-image", action="store_true",
                     help="also generate an article-based image using OpenAI")
+    sp.add_argument("--image", "-i",
+                    help="use this local image with the article draft instead of generating one")
+    sp.add_argument("--alt",
+                    help="alt text for --image")
     sp.add_argument("--image-model", default=None,
                     help=f"OpenAI image model for --with-image (default: {OPENAI_IMAGE_MODEL})")
     sp.add_argument("--image-size", default=None,

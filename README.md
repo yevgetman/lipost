@@ -172,6 +172,7 @@ Turn an article URL into a LinkedIn post. The flow:
 lipost article                                    # prompts for URL
 lipost article https://blog.example.com/post      # generate + review + post
 lipost article --with-image https://...           # also generate an OpenAI image
+lipost article --image pic.jpg https://...        # use your own image with the draft
 lipost article --dry-run https://...              # everything except the actual publish
 lipost article --queue https://...                # at [q] → enqueue as approved
 lipost article --queue-pending https://...        # at [q] → enqueue as pending_approval
@@ -185,6 +186,8 @@ lipost article --queue-pending https://...        # at [q] → enqueue as pendin
 - A persona prompt at `~/.config/lipost/prompt.md` (or set `LIPOST_PROMPT=/path/to/prompt.md`).
 
 `--with-image` keeps the article-reading step in Claude. Claude returns the post text plus an image prompt and alt text; lipost then calls OpenAI's Images API, saves the result under `~/.local/share/lipost/images/generated/`, and posts or queues the generated image with the caption.
+
+`--image PATH` uses your own JPEG, PNG, or GIF with the article draft instead of generating one. Add `--alt "..."` to provide alt text.
 
 ### What goes in the persona prompt
 
