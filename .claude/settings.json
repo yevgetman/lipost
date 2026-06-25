@@ -1,0 +1,64 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(mkfs:*)",
+      "Bash(dd if=:*)",
+      "Edit(/Users/julie/code/lipost/org/bylaws.md)",
+      "Edit(/Users/julie/code/lipost/org/amendments.md)",
+      "Edit(/Users/julie/code/lipost/org/sop/**)",
+      "Write(/Users/julie/code/lipost/org/bylaws.md)",
+      "Write(/Users/julie/code/lipost/org/amendments.md)",
+      "Write(/Users/julie/code/lipost/org/sop/**)",
+      "MultiEdit(/Users/julie/code/lipost/org/bylaws.md)",
+      "MultiEdit(/Users/julie/code/lipost/org/amendments.md)",
+      "MultiEdit(/Users/julie/code/lipost/org/sop/**)",
+      "NotebookEdit(/Users/julie/code/lipost/org/bylaws.md)",
+      "NotebookEdit(/Users/julie/code/lipost/org/amendments.md)",
+      "NotebookEdit(/Users/julie/code/lipost/org/sop/**)",
+      "Read(/Users/julie/.config/firm/**)",
+      "Bash(cat /Users/julie/.config/firm/*:*)",
+      "Bash(head /Users/julie/.config/firm/*:*)",
+      "Bash(tail /Users/julie/.config/firm/*:*)",
+      "Bash(less /Users/julie/.config/firm/*:*)",
+      "Bash(xxd /Users/julie/.config/firm/*:*)",
+      "Bash(od /Users/julie/.config/firm/*:*)",
+      "Bash(strings /Users/julie/.config/firm/*:*)",
+      "Read(~/.config/firm/**)",
+      "Bash(cat ~/.config/firm/*:*)",
+      "Bash(head ~/.config/firm/*:*)",
+      "Bash(tail ~/.config/firm/*:*)",
+      "Bash(less ~/.config/firm/*:*)",
+      "Bash(xxd ~/.config/firm/*:*)",
+      "Bash(od ~/.config/firm/*:*)",
+      "Bash(strings ~/.config/firm/*:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/Users/julie/code/thefirm/packages/firm-guardrail/adapters/claude_hook.py\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/Users/julie/code/thefirm/packages/firm-cli/adapters/claude_session_start.py\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
