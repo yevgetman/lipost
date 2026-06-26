@@ -2,6 +2,24 @@
 
 > `CLAUDE.md` is mirrored at `AGENTS.md` — edit both.
 
+A small, dependency-free Python CLI for posting to your personal LinkedIn feed from the terminal, plus two
+optional layers: an article→post skill (`lipost article <url>`) and a launchd-driven autoposter with a
+human-approval draft queue (`lipost {drafts,bot} …`).
+
+## Documentation (progressive disclosure — SOP-13)
+
+This is a thin router. The docs are progressively disclosed: start at the master index, then descend on
+demand — never read the whole corpus to find one fact.
+
+| Read this | When you want to … |
+| --- | --- |
+| [docs/Documentation_Table_Of_Contents.md](docs/Documentation_Table_Of_Contents.md) | Orient — the master index of every doc |
+| [docs/01-overview/what-is-lipost.md](docs/01-overview/what-is-lipost.md) | Understand what lipost is + the three-layer model |
+| [docs/02-architecture/single-file-design.md](docs/02-architecture/single-file-design.md) | See how the single-file CLI, runtime data, auth, and the bot are built |
+| [docs/03-cli-reference/command-reference.md](docs/03-cli-reference/command-reference.md) | Look up a command, flag, or `bot.json` config key |
+| [README.md](README.md) | The full human-facing walkthrough + first-time setup |
+| [docs/How_To_Work_With_Docs.md](docs/How_To_Work_With_Docs.md) | Add, edit, move, or delete a doc (read before touching `docs/`) |
+
 ## Building a feature → SOP-12 (inherited from the Firm apex)
 
 This repo's build procedure is the Firm's **apex SOP-12 — "Build a codebase"**, inherited via the firm
