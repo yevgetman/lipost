@@ -1,7 +1,7 @@
 # How to work with the docs
 
 The operating manual for this documentation set. Read it **before** adding, editing, moving, or deleting a
-doc. The set follows the Firm's **SOP-13 — Progressive-disclosure documentation**; this file is the local,
+doc. The set follows the Factory's **SOP-13 — Progressive-disclosure documentation**; this file is the local,
 scaled-down procedure.
 
 ---
@@ -62,4 +62,4 @@ in sync too when behavior changes.)
 
 - [Documentation Table of Contents](Documentation_Table_Of_Contents.md) — what exists
 - [`/CLAUDE.md`](../CLAUDE.md) / [`/AGENTS.md`](../AGENTS.md) — the thin router this set hangs off
-- Full SOP: `~/code/me/org/sop/13-progressive-disclosure-docs.md` (inherited from the Firm apex)
+- Full SOP: `~/code/me/org/sop/13-progressive-disclosure-docs.md` (inherited from the Factory apex)

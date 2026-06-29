@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"/Users/julie/code/thefirm/packages/firm-guardrail/adapters/claude_hook.py\""
+            "command": "python3 \"/Users/julie/code/thefirm/packages/factory-guardrail/adapters/claude_hook.py\""
           }
         ]
       }
@@ -54,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"/Users/julie/code/thefirm/packages/firm-cli/adapters/claude_session_start.py\"",
+            "command": "python3 \"/Users/julie/code/thefirm/packages/factory-cli/adapters/claude_session_start.py\"",
             "timeout": 15
           }
         ]
