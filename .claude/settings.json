@@ -18,22 +18,22 @@
       "NotebookEdit(/Users/julie/code/lipost/org/bylaws.md)",
       "NotebookEdit(/Users/julie/code/lipost/org/amendments.md)",
       "NotebookEdit(/Users/julie/code/lipost/org/sop/**)",
-      "Read(/Users/julie/.config/firm/**)",
-      "Bash(cat /Users/julie/.config/firm/*:*)",
-      "Bash(head /Users/julie/.config/firm/*:*)",
-      "Bash(tail /Users/julie/.config/firm/*:*)",
-      "Bash(less /Users/julie/.config/firm/*:*)",
-      "Bash(xxd /Users/julie/.config/firm/*:*)",
-      "Bash(od /Users/julie/.config/firm/*:*)",
-      "Bash(strings /Users/julie/.config/firm/*:*)",
-      "Read(~/.config/firm/**)",
-      "Bash(cat ~/.config/firm/*:*)",
-      "Bash(head ~/.config/firm/*:*)",
-      "Bash(tail ~/.config/firm/*:*)",
-      "Bash(less ~/.config/firm/*:*)",
-      "Bash(xxd ~/.config/firm/*:*)",
-      "Bash(od ~/.config/firm/*:*)",
-      "Bash(strings ~/.config/firm/*:*)"
+      "Read(/Users/julie/.config/factory/**)",
+      "Bash(cat /Users/julie/.config/factory/*:*)",
+      "Bash(head /Users/julie/.config/factory/*:*)",
+      "Bash(tail /Users/julie/.config/factory/*:*)",
+      "Bash(less /Users/julie/.config/factory/*:*)",
+      "Bash(xxd /Users/julie/.config/factory/*:*)",
+      "Bash(od /Users/julie/.config/factory/*:*)",
+      "Bash(strings /Users/julie/.config/factory/*:*)",
+      "Read(~/.config/factory/**)",
+      "Bash(cat ~/.config/factory/*:*)",
+      "Bash(head ~/.config/factory/*:*)",
+      "Bash(tail ~/.config/factory/*:*)",
+      "Bash(less ~/.config/factory/*:*)",
+      "Bash(xxd ~/.config/factory/*:*)",
+      "Bash(od ~/.config/factory/*:*)",
+      "Bash(strings ~/.config/factory/*:*)"
     ]
   },
   "hooks": {
@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"/Users/julie/code/thefirm/packages/factory-guardrail/adapters/claude_hook.py\""
+            "command": "python3 \"/Users/julie/code/thefactory/packages/factory-guardrail/adapters/claude_hook.py\""
           }
         ]
       }
@@ -54,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"/Users/julie/code/thefirm/packages/factory-cli/adapters/claude_session_start.py\"",
+            "command": "python3 \"/Users/julie/code/thefactory/packages/factory-cli/adapters/claude_session_start.py\"",
             "timeout": 15
           }
         ]
