@@ -33,7 +33,19 @@
       "Bash(less ~/.config/factory/*:*)",
       "Bash(xxd ~/.config/factory/*:*)",
       "Bash(od ~/.config/factory/*:*)",
-      "Bash(strings ~/.config/factory/*:*)"
+      "Bash(strings ~/.config/factory/*:*)",
+      "Edit(/Users/julie/.factory/bylaws.md)",
+      "Edit(/Users/julie/.factory/amendments.md)",
+      "Edit(/Users/julie/.factory/sop/**)",
+      "Write(/Users/julie/.factory/bylaws.md)",
+      "Write(/Users/julie/.factory/amendments.md)",
+      "Write(/Users/julie/.factory/sop/**)",
+      "MultiEdit(/Users/julie/.factory/bylaws.md)",
+      "MultiEdit(/Users/julie/.factory/amendments.md)",
+      "MultiEdit(/Users/julie/.factory/sop/**)",
+      "NotebookEdit(/Users/julie/.factory/bylaws.md)",
+      "NotebookEdit(/Users/julie/.factory/amendments.md)",
+      "NotebookEdit(/Users/julie/.factory/sop/**)"
     ]
   },
   "hooks": {
