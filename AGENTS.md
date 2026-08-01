@@ -1,4 +1,4 @@
-# lipost — the `lipost` node of The Factory
+# lipost — the `lipost` node of Kernel
 
 > `CLAUDE.md` is mirrored at `AGENTS.md` — edit both.
 
@@ -20,9 +20,9 @@ demand — never read the whole corpus to find one fact.
 | [README.md](README.md) | The full human-facing walkthrough + first-time setup |
 | [docs/How_To_Work_With_Docs.md](docs/How_To_Work_With_Docs.md) | Add, edit, move, or delete a doc (read before touching `docs/`) |
 
-## Building a feature → SOP-12 (inherited from the Factory apex)
+## Building a feature → SOP-12 (inherited from the Kernel apex)
 
-This repo's build procedure is the Factory's **apex SOP-12 — "Build a codebase"**, inherited via the factory
+This repo's build procedure is Kernel's **apex SOP-12 — "Build a codebase"**, inherited via the factory
 governance cascade. The agent governing this repo **must follow it for any code build, without being told**.
 Shape: **spec → CEO green-light → autonomous subagent build → docs + tests → ship.**
 

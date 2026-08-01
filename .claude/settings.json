@@ -24,16 +24,56 @@
       "Bash(strings ~/.config/factory/*:*)",
       "Edit(/Users/julie/.factory/bylaws.md)",
       "Edit(/Users/julie/.factory/amendments.md)",
+      "Edit(/Users/julie/.factory/charter.md)",
+      "Edit(/Users/julie/.factory/communications.md)",
+      "Edit(/Users/julie/.factory/orchestrator.md)",
+      "Edit(/Users/julie/.factory/observability.md)",
       "Edit(/Users/julie/.factory/sop/**)",
+      "Edit(/Users/julie/.factory/directives.md)",
+      "Edit(/Users/julie/.factory/operating-procedure.md)",
+      "Edit(/Users/julie/.factory/guardrails.md)",
+      "Edit(/Users/julie/.factory/heartbeat-prompt.md)",
+      "Edit(/Users/julie/.factory/heartbeat-node-prompt.md)",
+      "Edit(/Users/julie/.factory/personas/julie-coo.md)",
       "Write(/Users/julie/.factory/bylaws.md)",
       "Write(/Users/julie/.factory/amendments.md)",
+      "Write(/Users/julie/.factory/charter.md)",
+      "Write(/Users/julie/.factory/communications.md)",
+      "Write(/Users/julie/.factory/orchestrator.md)",
+      "Write(/Users/julie/.factory/observability.md)",
       "Write(/Users/julie/.factory/sop/**)",
+      "Write(/Users/julie/.factory/directives.md)",
+      "Write(/Users/julie/.factory/operating-procedure.md)",
+      "Write(/Users/julie/.factory/guardrails.md)",
+      "Write(/Users/julie/.factory/heartbeat-prompt.md)",
+      "Write(/Users/julie/.factory/heartbeat-node-prompt.md)",
+      "Write(/Users/julie/.factory/personas/julie-coo.md)",
       "MultiEdit(/Users/julie/.factory/bylaws.md)",
       "MultiEdit(/Users/julie/.factory/amendments.md)",
+      "MultiEdit(/Users/julie/.factory/charter.md)",
+      "MultiEdit(/Users/julie/.factory/communications.md)",
+      "MultiEdit(/Users/julie/.factory/orchestrator.md)",
+      "MultiEdit(/Users/julie/.factory/observability.md)",
       "MultiEdit(/Users/julie/.factory/sop/**)",
+      "MultiEdit(/Users/julie/.factory/directives.md)",
+      "MultiEdit(/Users/julie/.factory/operating-procedure.md)",
+      "MultiEdit(/Users/julie/.factory/guardrails.md)",
+      "MultiEdit(/Users/julie/.factory/heartbeat-prompt.md)",
+      "MultiEdit(/Users/julie/.factory/heartbeat-node-prompt.md)",
+      "MultiEdit(/Users/julie/.factory/personas/julie-coo.md)",
       "NotebookEdit(/Users/julie/.factory/bylaws.md)",
       "NotebookEdit(/Users/julie/.factory/amendments.md)",
-      "NotebookEdit(/Users/julie/.factory/sop/**)"
+      "NotebookEdit(/Users/julie/.factory/charter.md)",
+      "NotebookEdit(/Users/julie/.factory/communications.md)",
+      "NotebookEdit(/Users/julie/.factory/orchestrator.md)",
+      "NotebookEdit(/Users/julie/.factory/observability.md)",
+      "NotebookEdit(/Users/julie/.factory/sop/**)",
+      "NotebookEdit(/Users/julie/.factory/directives.md)",
+      "NotebookEdit(/Users/julie/.factory/operating-procedure.md)",
+      "NotebookEdit(/Users/julie/.factory/guardrails.md)",
+      "NotebookEdit(/Users/julie/.factory/heartbeat-prompt.md)",
+      "NotebookEdit(/Users/julie/.factory/heartbeat-node-prompt.md)",
+      "NotebookEdit(/Users/julie/.factory/personas/julie-coo.md)"
     ]
   },
   "hooks": {
@@ -43,7 +83,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"/Users/julie/code/thefactory/packages/factory-guardrail/adapters/claude_hook.py\""
+            "command": "\"/Users/julie/.factory-runtime/0.32.8/factory-runtime-0.32.8-macos-arm64/factory\" __guardrail-hook"
           }
         ]
       }
@@ -54,7 +94,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"/Users/julie/code/thefactory/packages/factory-cli/adapters/claude_session_start.py\"",
+            "command": "\"/Users/julie/.factory-runtime/0.32.8/factory-runtime-0.32.8-macos-arm64/factory\" __session-start",
             "timeout": 15
           }
         ]
