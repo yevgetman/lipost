@@ -83,7 +83,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"/Users/julie/.factory-runtime/0.32.8/factory-runtime-0.32.8-macos-arm64/factory\" __guardrail-hook"
+            "command": "\"/Users/julie/.factory-runtime/0.33.0/kernel-runtime-0.33.0-macos-arm64/kernel\" __guardrail-hook"
           }
         ]
       }
@@ -94,7 +94,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"/Users/julie/.factory-runtime/0.32.8/factory-runtime-0.32.8-macos-arm64/factory\" __session-start",
+            "command": "\"/Users/julie/.factory-runtime/0.33.0/kernel-runtime-0.33.0-macos-arm64/kernel\" __session-start",
             "timeout": 15
           }
         ]
