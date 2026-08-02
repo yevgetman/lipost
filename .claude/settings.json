@@ -22,6 +22,58 @@
       "Bash(xxd ~/.config/factory/*:*)",
       "Bash(od ~/.config/factory/*:*)",
       "Bash(strings ~/.config/factory/*:*)",
+      "Edit(/Users/julie/.kernel/bylaws.md)",
+      "Edit(/Users/julie/.kernel/amendments.md)",
+      "Edit(/Users/julie/.kernel/charter.md)",
+      "Edit(/Users/julie/.kernel/communications.md)",
+      "Edit(/Users/julie/.kernel/orchestrator.md)",
+      "Edit(/Users/julie/.kernel/observability.md)",
+      "Edit(/Users/julie/.kernel/sop/**)",
+      "Edit(/Users/julie/.kernel/directives.md)",
+      "Edit(/Users/julie/.kernel/operating-procedure.md)",
+      "Edit(/Users/julie/.kernel/guardrails.md)",
+      "Edit(/Users/julie/.kernel/heartbeat-prompt.md)",
+      "Edit(/Users/julie/.kernel/heartbeat-node-prompt.md)",
+      "Edit(/Users/julie/.kernel/personas/julie-coo.md)",
+      "Write(/Users/julie/.kernel/bylaws.md)",
+      "Write(/Users/julie/.kernel/amendments.md)",
+      "Write(/Users/julie/.kernel/charter.md)",
+      "Write(/Users/julie/.kernel/communications.md)",
+      "Write(/Users/julie/.kernel/orchestrator.md)",
+      "Write(/Users/julie/.kernel/observability.md)",
+      "Write(/Users/julie/.kernel/sop/**)",
+      "Write(/Users/julie/.kernel/directives.md)",
+      "Write(/Users/julie/.kernel/operating-procedure.md)",
+      "Write(/Users/julie/.kernel/guardrails.md)",
+      "Write(/Users/julie/.kernel/heartbeat-prompt.md)",
+      "Write(/Users/julie/.kernel/heartbeat-node-prompt.md)",
+      "Write(/Users/julie/.kernel/personas/julie-coo.md)",
+      "MultiEdit(/Users/julie/.kernel/bylaws.md)",
+      "MultiEdit(/Users/julie/.kernel/amendments.md)",
+      "MultiEdit(/Users/julie/.kernel/charter.md)",
+      "MultiEdit(/Users/julie/.kernel/communications.md)",
+      "MultiEdit(/Users/julie/.kernel/orchestrator.md)",
+      "MultiEdit(/Users/julie/.kernel/observability.md)",
+      "MultiEdit(/Users/julie/.kernel/sop/**)",
+      "MultiEdit(/Users/julie/.kernel/directives.md)",
+      "MultiEdit(/Users/julie/.kernel/operating-procedure.md)",
+      "MultiEdit(/Users/julie/.kernel/guardrails.md)",
+      "MultiEdit(/Users/julie/.kernel/heartbeat-prompt.md)",
+      "MultiEdit(/Users/julie/.kernel/heartbeat-node-prompt.md)",
+      "MultiEdit(/Users/julie/.kernel/personas/julie-coo.md)",
+      "NotebookEdit(/Users/julie/.kernel/bylaws.md)",
+      "NotebookEdit(/Users/julie/.kernel/amendments.md)",
+      "NotebookEdit(/Users/julie/.kernel/charter.md)",
+      "NotebookEdit(/Users/julie/.kernel/communications.md)",
+      "NotebookEdit(/Users/julie/.kernel/orchestrator.md)",
+      "NotebookEdit(/Users/julie/.kernel/observability.md)",
+      "NotebookEdit(/Users/julie/.kernel/sop/**)",
+      "NotebookEdit(/Users/julie/.kernel/directives.md)",
+      "NotebookEdit(/Users/julie/.kernel/operating-procedure.md)",
+      "NotebookEdit(/Users/julie/.kernel/guardrails.md)",
+      "NotebookEdit(/Users/julie/.kernel/heartbeat-prompt.md)",
+      "NotebookEdit(/Users/julie/.kernel/heartbeat-node-prompt.md)",
+      "NotebookEdit(/Users/julie/.kernel/personas/julie-coo.md)",
       "Edit(/Users/julie/.factory/bylaws.md)",
       "Edit(/Users/julie/.factory/amendments.md)",
       "Edit(/Users/julie/.factory/charter.md)",
@@ -83,7 +135,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"/Users/julie/.factory-runtime/0.33.0/kernel-runtime-0.33.0-macos-arm64/kernel\" __guardrail-hook"
+            "command": "\"/Users/julie/.kernel-runtime/0.34.0/kernel-runtime-0.34.0-macos-arm64/factory\" __guardrail-hook"
           }
         ]
       }
@@ -94,7 +146,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"/Users/julie/.factory-runtime/0.33.0/kernel-runtime-0.33.0-macos-arm64/kernel\" __session-start",
+            "command": "\"/Users/julie/.kernel-runtime/0.34.0/kernel-runtime-0.34.0-macos-arm64/factory\" __session-start",
             "timeout": 15
           }
         ]

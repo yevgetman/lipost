@@ -1,0 +1,6 @@
+node: lipost
+children: []
+authoritative: me/org/nodes/lipost
+parent: me
+domain:
+- /Users/julie/code/lipost
